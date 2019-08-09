@@ -57,7 +57,8 @@ end
 
 dir = File.expand_path(File.dirname(__FILE__))
 
-tc = TransparentClassroom::Client.new base_url: 'http://localhost:3000/api/v1'
+# tc = TransparentClassroom::Client.new base_url: 'http://localhost:3000/api/v1'
+tc = TransparentClassroom::Client.new
 tc.masquerade_id = 50612 # cam
 
 schools = tc.get 'schools.json'
