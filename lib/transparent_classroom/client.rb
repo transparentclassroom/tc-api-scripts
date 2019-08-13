@@ -31,6 +31,10 @@ module TransparentClassroom
       @client[url].post(body, params: params)
     end
 
+    def find_sessions
+      get 'sessions.json'
+    end
+
     def find_session(name:)
       sessions = get 'sessions.json'
       if (session = sessions.detect { |s| s['name'] == name })
