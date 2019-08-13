@@ -89,7 +89,7 @@ schools.each do |school|
 
   tc.school_id = school['id']
 
-  # Helper for loading school_year with sessions and latest start and earliest stop dates
+  # Helper for loading school_year sessions and latest start and earliest stop dates
   # school_year formatting expected to match: e.g. '2018-19'
   load_sessions_for_school_year = lambda do |school_year|
     results = {'sessions'=>[], 'start_date'=>nil, 'stop_date'=>nil}
