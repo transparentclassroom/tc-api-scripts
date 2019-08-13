@@ -41,6 +41,19 @@ module TransparentClassroom
       end
     end
 
+    def find_session_by_dates(start_date:, stop_date:)
+      sessions = get 'sessions.json'
+      if (session = sessions.detect { |s|
+              Date.parse(s['start_date']) <= Date.parse(start_date) and
+              Date.parse(s['start_date']).year == Date.parse(start_date).year and
+              Date.parse(s['stop_date']) >= Date.parse(stop_date) and
+              Date.parse(s['stop_date']).year == Date.parse(stop_date).year})
+        session
+      else
+        nil
+      end
+    end
+
     private
 
     def as_json(response)

@@ -2,8 +2,9 @@ require 'colorize'
 require 'csv'
 require_relative './lib/transparent_classroom/client'
 
-PREVIOUS_YEAR = '2018-19'
-CURRENT_YEAR = '2019-20'
+# Dates assume latest possible start and earliest possible finish
+PREVIOUS_YEAR = {name: '2018-19', start_date: '2018-09-15', stop_date: '2019-05-01'}
+CURRENT_YEAR = {name: '2019-20', start_date: '2019-09-15', stop_date: '2020-05-01'}
 
 def load_children(tc, school, session)
   children = tc.get 'children.json', params: { session_id: session['id'] }
@@ -62,6 +63,9 @@ tc = TransparentClassroom::Client.new
 tc.masquerade_id = 50612 # cam
 
 schools = tc.get 'schools.json'
+schools = schools.delete_if do |school|
+  school['type'] == 'Network' or school['name'] == 'Cloud Flower'
+end
 # schools = schools[0..2]
 current_children = {}
 stats = {}
@@ -70,17 +74,29 @@ puts '=' * 100
 puts "Loading school years".bold
 puts '=' * 100
 schools = schools.each do |school|
-  next if school['type'] == 'Network'
-  next if school['name'] == 'Cloud Flower'
   tc.school_id = school['id']
 
   puts school['name'].bold
-  school['current_year'] = tc.find_session(name: CURRENT_YEAR)
-  school['previous_year'] = tc.find_session(name: PREVIOUS_YEAR)
+
+  fetch_session = ->(name:, start_date:, stop_date:) do
+    session = tc.find_session_by_dates(start_date: start_date, stop_date: stop_date)
+
+    if session
+      puts "Found #{name} session - '#{session['name']}' (start: #{session['start_date']} - stop: #{session['stop_date']})"
+    else
+      puts "Couldn't find #{name} session".red
+    end
+
+    return session
+  end
+
+  school['current_year'] = fetch_session.call(CURRENT_YEAR)
+  school['previous_year'] = fetch_session.call(PREVIOUS_YEAR)
+
+  puts
 end
 
-
-CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
+CSV.open("#{dir}/children_#{CURRENT_YEAR[:name]}.csv", 'wb') do |csv|
   csv << [
     'School',
     'First',
@@ -88,7 +104,7 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
     'Birthdate',
   ]
   puts '=' * 100
-  puts "Loading Children for #{CURRENT_YEAR}".bold
+  puts "Loading Children for #{CURRENT_YEAR[:name]}".bold
   puts '=' * 100
   schools.each do |school|
     next if (current_year = school['current_year']).nil?
@@ -105,7 +121,7 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
       ]
       id = fingerprint(child)
       if current_children.has_key?(id)
-        puts "Child #{id} is in multiple places in #{CURRENT_YEAR}".red
+        puts "Child #{id} is in multiple places in #{CURRENT_YEAR[:name]}".red
       else
         current_children[id] = child
       end
@@ -113,7 +129,7 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
   end
 end
 
-CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
+CSV.open("#{dir}/children_#{PREVIOUS_YEAR[:name]}.csv", 'wb') do |csv|
   csv << [
     'School',
     'First',
@@ -134,7 +150,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
 
   puts
   puts '=' * 100
-  puts "Seeing which children from #{PREVIOUS_YEAR} are continuing".bold
+  puts "Seeing which children from #{PREVIOUS_YEAR[:name]} are continuing".bold
   puts '=' * 100
   schools.each do |school|
     stats[school] = school_stats = {
@@ -207,8 +223,8 @@ CSV.open("#{dir}/school_rates.csv", 'wb') do |csv|
     g, c, d = school_stats[:graduating].length, school_stats[:continuing].length, school_stats[:dropping].length
     row = [school['name'], g, c, d]
     notes = []
-    notes << "No #{PREVIOUS_YEAR} session" if school['previous_year'].nil?
-    notes << "No #{CURRENT_YEAR} session" if school['current_year'].nil?
+    notes << "No #{PREVIOUS_YEAR[:name]} session" if school['previous_year'].nil?
+    notes << "No #{CURRENT_YEAR[:name]} session" if school['current_year'].nil?
 
     if g + c + d > 0
       rate = c * 100 / (c + d)
