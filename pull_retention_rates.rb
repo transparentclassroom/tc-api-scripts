@@ -85,56 +85,48 @@ puts '=' * 100
 puts "Loading school years".bold
 puts '=' * 100
 schools.each do |school|
-  puts school['name'].bold
-
-  school['current_year'] = {'sessions'=>[], 'start_date'=>nil, 'stop_date'=>nil}
-  school['previous_year'] = {'sessions'=>[], 'start_date'=>nil, 'stop_date'=>nil}
-
-  current_year_start = Date.parse("#{CURRENT_YEAR.split('-')[0]}/#{SCHOOL_YEAR_LATEST_START}")
-  current_year_stop  = Date.parse("#{CURRENT_YEAR.split('-')[1]}/#{SCHOOL_YEAR_EARLIEST_STOP}")
-  previous_year_start = Date.parse("#{PREVIOUS_YEAR.split('-')[0]}/#{SCHOOL_YEAR_LATEST_START}")
-  previous_year_stop  = Date.parse("#{PREVIOUS_YEAR.split('-')[1]}/#{SCHOOL_YEAR_EARLIEST_STOP}")
+  puts "#{school['name'].bold} Sessions"
 
   tc.school_id = school['id']
-  sessions = tc.find_sessions
 
-  # It's possible the school year is broken across multiple sessions
-  # Build a list of all sessions for the current and previous school years, also track the unofficial start/end dates
-  sessions.each do |s|
-    session_start_date = Date.parse(s['start_date'])
-    session_stop_date = Date.parse(s['stop_date'])
+  # Helper for loading school_year with sessions and latest start and earliest stop dates
+  # school_year formatting expected to match: e.g. '2018-19'
+  load_sessions_for_school_year = lambda do |school_year|
+    results = {'sessions'=>[], 'start_date'=>nil, 'stop_date'=>nil}
 
-    # Helper for appending school_year with sessions and earliest start and latest stop dates
-    append_current_session_to_school_year = lambda do |school_year|
-      school_year['sessions'] << s
+    parse_date_from_year_and_day = lambda do |split_year, day|
+      return Date.parse("#{split_year}/#{day}")
+    end
 
-      if school_year['start_date'].nil? or Date.parse(school_year['start_date']) < session_start_date
-        school_year['start_date'] = s['start_date']
+    latest_start = parse_date_from_year_and_day.call(school_year.split('-')[0], SCHOOL_YEAR_LATEST_START)
+    earliest_stop = parse_date_from_year_and_day.call(school_year.split('-')[1], SCHOOL_YEAR_EARLIEST_STOP)
+
+    sessions = tc.find_sessions_by_school_year(
+        latest_start:    latest_start,
+        earliest_stop:   earliest_stop,
+        min_school_days: MIN_SESSION_LENGTH_DAYS)
+    sessions.each {|s| puts "#{school_year} - '#{s['name']}' (start: #{s['start_date']}, stop: #{s['stop_date']})"}
+
+    results['sessions'] = sessions
+
+    sessions.each do |session|
+      session_start_date = Date.parse(session['start_date'])
+      session_stop_date = Date.parse(session['stop_date'])
+
+      if results['start_date'].nil? or Date.parse(results['start_date']) < session_start_date
+        results['start_date'] = session['start_date']
       end
 
-      if school_year['stop_date'].nil? or Date.parse(school_year['stop_date']) > session_stop_date
-        school_year['stop_date'] = s['stop_date']
+      if results['stop_date'].nil? or Date.parse(results['stop_date']) > session_stop_date
+        results['stop_date'] = session['stop_date']
       end
     end
 
-    if session_start_date <= current_year_stop and
-       session_stop_date >= current_year_start and
-       session_stop_date - session_start_date >= MIN_SESSION_LENGTH_DAYS
-
-      puts "#{CURRENT_YEAR} - '#{s['name']}' (start: #{s['start_date']} - stop: #{s['stop_date']})"
-      append_current_session_to_school_year.call(school['current_year'])
-
-    elsif session_start_date <= previous_year_stop and
-          session_stop_date >= previous_year_start and
-          session_stop_date - session_start_date >= MIN_SESSION_LENGTH_DAYS
-
-      puts "#{PREVIOUS_YEAR} - '#{s['name']}' (start: #{s['start_date']} - stop: #{s['stop_date']})"
-      append_current_session_to_school_year.call(school['previous_year'])
-
-    else
-      puts "IGNORED - '#{s['name']}' (start: #{s['start_date']} - stop: #{s['stop_date']})"
-    end
+    results
   end
+
+  school['previous_year'] = load_sessions_for_school_year.call(PREVIOUS_YEAR)
+  school['current_year'] = load_sessions_for_school_year.call(CURRENT_YEAR)
 
   puts
 end

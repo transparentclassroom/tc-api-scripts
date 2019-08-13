@@ -31,10 +31,6 @@ module TransparentClassroom
       @client[url].post(body, params: params)
     end
 
-    def find_sessions
-      get 'sessions.json'
-    end
-
     def find_session(name:)
       sessions = get 'sessions.json'
       if (session = sessions.detect { |s| s['name'] == name })
@@ -45,16 +41,16 @@ module TransparentClassroom
       end
     end
 
-    def find_session_by_dates(start_date:, stop_date:)
+    # Fetch all sessions that make up a school year
+    def find_sessions_by_school_year(latest_start:, earliest_stop:, min_school_days: 0)
       sessions = get 'sessions.json'
-      if (session = sessions.detect { |s|
-              Date.parse(s['start_date']) <= Date.parse(start_date) and
-              Date.parse(s['start_date']).year == Date.parse(start_date).year and
-              Date.parse(s['stop_date']) >= Date.parse(stop_date) and
-              Date.parse(s['stop_date']).year == Date.parse(stop_date).year})
-        session
-      else
-        nil
+      sessions.select do |s|
+        session_start_date = Date.parse(s['start_date'])
+        session_stop_date = Date.parse(s['stop_date'])
+
+        session_start_date <= earliest_stop and
+        session_stop_date >= latest_start and
+        session_stop_date - session_start_date >= min_school_days
       end
     end
 
