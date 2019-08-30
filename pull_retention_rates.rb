@@ -42,19 +42,19 @@ end
 def too_old?(classroom, age)
   case classroom['level']
     when '0-1.5'
-      age > to_age(years: 1, months: 6)
+      age >= to_age(years: 1, months: 6)
     when '1.5-3', '0-3'
-      age > to_age(years: 3)
+      age >= to_age(years: 3)
     when '3-6'
-      age > to_age(years: 6)
+      age >= to_age(years: 6)
     when '6-9'
-      age > to_age(years: 9)
+      age >= to_age(years: 9)
     when '6-12'
-      age > to_age(years: 12)
+      age >= to_age(years: 12)
     when '9-12'
-      age > to_age(years: 12)
+      age >= to_age(years: 12)
     when '12-15'
-      age > to_age(years: 15)
+      age >= to_age(years: 15)
     else
       puts "don't know how to handle level #{classroom['level']}".red
       false
@@ -63,6 +63,11 @@ end
 
 def name(child)
   "#{child['first_name']} #{child['last_name']}"
+end
+
+def new_school_year
+  school_year_template = {'children'=>{}, 'sessions'=>[], 'start_date'=>nil, 'stop_date'=>nil}
+  Marshal.load(Marshal.dump(school_year_template))
 end
 
 dir = File.expand_path(File.dirname(__FILE__))
@@ -76,8 +81,8 @@ schools.reject! do |school|
   school['type'] == 'Network' or school['name'] == 'Cloud Flower'
 end
 
-# schools = schools[0..2]
-# schools.reject! {|s| s['name'] != 'Wisteria Montessori'}
+# schools = schools[0..3]
+# schools.reject! {|s| s['name'] != 'Acorn Montessori'}
 current_children = {}
 stats = {}
 
@@ -92,7 +97,7 @@ schools.each do |school|
   # Helper for loading school_year sessions and latest start and earliest stop dates
   # school_year formatting expected to match: e.g. '2018-19'
   load_sessions_for_school_year = lambda do |school_year|
-    results = {'sessions'=>[], 'start_date'=>nil, 'stop_date'=>nil}
+    results = new_school_year.slice('sessions', 'start_date', 'stop_date')
 
     parse_date_from_year_and_day = lambda do |split_year, day|
       return Date.parse("#{split_year}/#{day}")
@@ -125,8 +130,8 @@ schools.each do |school|
     results
   end
 
-  school['previous_year'] = load_sessions_for_school_year.call(PREVIOUS_YEAR)
-  school['current_year'] = load_sessions_for_school_year.call(CURRENT_YEAR)
+  school['previous_year'] = new_school_year.merge(load_sessions_for_school_year.call(PREVIOUS_YEAR))
+  school['current_year'] = new_school_year.merge(load_sessions_for_school_year.call(CURRENT_YEAR))
 
   puts
 end
@@ -159,6 +164,7 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
         if current_children.has_key?(id)
           puts "Child #{id} is in multiple places in #{CURRENT_YEAR}".red
         else
+          current_year['children'][id] = child
           current_children[id] = child
         end
       end
@@ -215,6 +221,8 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         end
         classroom = classrooms.first
 
+        id = fingerprint(child)
+
         csv << [
           school['name'],
           child['first_name'],
@@ -228,10 +236,12 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
           format_age(age_on(child, date)),
           age_on(child, date),
           date,
-          current_children.has_key?(fingerprint(child)) ? 'Y' : 'N',
+          current_children.has_key?(id) ? 'Y' : 'N',
           too_old?(classroom, age_on(child, date)) ? 'Y' : 'N',
           notes.join("\n"),
         ]
+
+        previous_year['children'][id] = child
 
         if too_old?(classroom, age_on(child, date))
           school_stats[:graduating] << child
@@ -252,6 +262,8 @@ puts '=' * 100
 CSV.open("#{dir}/school_rates.csv", 'wb') do |csv|
   csv << [
     'School',
+    "#{PREVIOUS_YEAR} Total",
+    "#{CURRENT_YEAR} Total",
     'Graduating',
     'Continuing',
     'Dropping',
@@ -259,8 +271,8 @@ CSV.open("#{dir}/school_rates.csv", 'wb') do |csv|
     'Notes',
   ]
   stats.each do |school, school_stats|
-    g, c, d = school_stats[:graduating].length, school_stats[:continuing].length, school_stats[:dropping].length
-    row = [school['name'], g, c, d]
+    tp, tc, g, c, d = school['previous_year']['children'].length, school['current_year']['children'].length, school_stats[:graduating].length, school_stats[:continuing].length, school_stats[:dropping].length
+    row = [school['name'], tp, tc, g, c, d]
     notes = []
     notes << "No #{PREVIOUS_YEAR} session" if school['previous_year']['sessions'].empty?
     notes << "No #{CURRENT_YEAR} session" if school['current_year']['sessions'].empty?
