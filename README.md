@@ -1,4 +1,4 @@
-# Transaprent Classroom API Scripts
+# Transparent Classroom API Scripts
 
 This is a collection of several API scripts using the Transparent Classroom API.
 
