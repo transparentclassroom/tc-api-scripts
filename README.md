@@ -16,5 +16,7 @@ Follow these instructions to run a script using ruby.
 
 1. Install gems ```bundle install```
 
-1. Run a script ```ruby ./pull_children.rb```
+1. Define optional `config.yml` (refer to `config.template.yml`)
+
+1. Run a script ```ruby ./pull_retention_rates.rb```
 

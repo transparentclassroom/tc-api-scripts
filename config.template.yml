@@ -1,0 +1,54 @@
+# ignoreSchools can be used to turn off stats for schools given a school name or id
+# schools will still be printed but no stats on the school will be generated
+ignoreSchools:
+  - id:
+    name:
+
+# ignoreClassrooms can be used to turn off stats for children who belong to specific classrooms
+# children who belong to an ignoredClassroom will still be printed, but no stats on these children will be generated
+# note: children may belong to multiple classrooms, if children belong to ANY non-ignored classrooms they will be included in generated stats
+# note: schoolId or schoolName is required because classroom ids are not guaranteed to be unique across TC
+ignoreClassrooms:
+  - schoolId:
+    schoolName:
+    classrooms:
+      - id:
+        name:
+
+# ignoreChildren can be used to turn off stats for specific children
+# children who belong to an ignoreChildren will still be printed, but no stats on these children will be generated
+# note: schoolId or schoolName is required because children ids are not guaranteed to be unique across TC
+ignoreChildren:
+  - schoolId:
+    schoolName:
+    children:
+      - id:
+        name:
+
+# groupSchools can be used to define/report aggregate stats on a collection of schools
+# groups can be defined using the schools array attribute, or the groupIds array attribute
+# the groupIds attribute can be used to reference other groups/subgroups, for e.g.
+#
+# groupSchools:
+#  - id: MinneapolisRegion
+#    name: Minneapolis
+#    schools:
+#      - id: 123
+#      - id: abc
+#  - id: StPaulRegion
+#    name: "St. Paul"
+#    schools:
+#      - id: 456
+#  - id: MinnesotaRegion
+#    groupIds:
+#      - MinneapolisRegion
+#      - StPaulRegion
+groupSchools:
+  - id:
+    type:
+    name:
+    schools:
+      - id:
+        name:
+    groupIds:
+      -

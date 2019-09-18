@@ -1,3 +1,5 @@
+output
 *.csv
 .ruby-gemset
 .ruby-version
+config.yml
