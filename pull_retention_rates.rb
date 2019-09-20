@@ -3,6 +3,7 @@ require 'colorize'
 require 'csv'
 require 'yaml'
 require_relative './lib/transparent_classroom/client'
+require_relative './lib/name_matcher/matcher'
 
 PREVIOUS_YEAR = '2018-19'
 CURRENT_YEAR = '2019-20'
@@ -210,7 +211,7 @@ tc.masquerade_id = 50612 # cam
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Snowdrop Montessori' and s['name'] != 'Wildflower Montessori'}
+#schools.reject! {|s| s['name'] != 'Snowdrop Montessori' && s['name'] != 'Wildflower Montessori' && s['name'] != 'Allium Montessori' }
 stats = {}
 
 puts '=' * 100
@@ -314,6 +315,28 @@ schools.each do |school|
   end
 end
 
+def does_children_collection_include(children, child)
+  if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
+    return true
+  end
+
+  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(is_child_ignored(c)) }
+  if children_with_birthdate.empty?
+    return false
+  end
+
+  puts "Performing fuzzy match on #{name(child)}"
+  nearest = children_with_birthdate.map{ |c| {c => NamesMatcher.distance(name(child), name(c))}}.min_by{|_, v| v}
+  match = nearest.values.first <= 0.8
+  if match
+    puts "Found #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
+  else
+    puts "No match, nearest candidate #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
+  end
+
+  match
+end
+
 puts
 puts "Organizing Collection of All Children for #{CURRENT_YEAR}".bold
 puts '=' * 100
@@ -373,8 +396,9 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
 
       classroom = get_child_active_classroom(child)
 
-      is_currently_enrolled_in_network = current_years_children.has_key?(child['fingerprint']) && not(is_child_ignored(child))
-      was_previously_enrolled_in_network = previous_years_children.has_key?(child['fingerprint']) && not(is_child_ignored(child))
+      is_currently_enrolled_in_network = does_children_collection_include(current_years_children, child)
+      was_previously_enrolled_in_network = does_children_collection_include(previous_years_children, child)
+
       was_previously_at_current_school = previous_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(is_child_ignored(c))}
       was_previously_at_different_school = was_previously_enrolled_in_network && not(was_previously_at_current_school)
 
@@ -462,10 +486,11 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
 
       classroom = get_child_active_classroom(child)
 
-      was_previously_enrolled_in_network = previous_years_children.has_key?(child['fingerprint']) && not(is_child_ignored(child))
-      is_continuing_in_network = current_years_children.has_key?(child['fingerprint']) && not(is_child_ignored(child))
+      is_currently_enrolled_in_network = does_children_collection_include(current_years_children, child)
+      was_previously_enrolled_in_network = does_children_collection_include(previous_years_children, child)
+
       is_continuing_at_current_school = current_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(is_child_ignored(c))}
-      is_continuing_at_different_school = is_continuing_in_network && not(is_continuing_at_current_school)
+      is_continuing_at_different_school = is_currently_enrolled_in_network && not(is_continuing_at_current_school)
 
       csv << [
         child['id'],
@@ -482,7 +507,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         format_age(age_on(child, start_date)),
         age_on(child, start_date),
         was_previously_enrolled_in_network,
-        is_continuing_in_network,
+        is_currently_enrolled_in_network,
         is_continuing_at_different_school,
         too_old?(classroom, age_on(child, start_date)) ? 'Y' : 'N',
         ignored ? 'Y' : 'N',
@@ -498,12 +523,12 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         school_stats[:graduating] << child
       # TODO: The next elsif test is analyzing the whole network, when computing retention within the school is this the right test?
       # elsif current_years_children.has_key?(fingerprint(child))
-      elsif is_continuing_in_network || is_continuing_at_current_school
+      elsif is_currently_enrolled_in_network || is_continuing_at_current_school
         school_stats[:continuing] << child
 
         if is_continuing_at_current_school
           school_stats[:continuing_at_school] << child
-        elsif is_continuing_in_network
+        elsif is_currently_enrolled_in_network
           school_stats[:continuing_in_network] << child
         end
       else
