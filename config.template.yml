@@ -1,3 +1,10 @@
+# rejectSchools will fully reject a school from consideration/evaluation
+# not only will stats not be computed, the school won't show up in notes nor will children be printed in the children.csv files
+# this is useful to ignore the "network" school and any test/demo schools that have been setup
+rejectSchools:
+  - id:
+    name:
+
 # ignoreSchools can be used to turn off stats for schools given a school name or id
 # schools will still be printed but no stats on the school will be generated
 ignoreSchools:
