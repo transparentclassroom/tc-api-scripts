@@ -111,6 +111,44 @@ def to_age(years:, months: 0)
   years * 12 + months
 end
 
+def age_appropriate_for_school?(school, age)
+  classrooms_by_id = school['classrooms_by_id']
+
+  age_appropriate = false
+  classrooms_by_id.each do |id, classroom|
+    age_appropriate = age_appropriate?(classroom, age)
+    break if age_appropriate
+  end
+
+  age_appropriate
+end
+
+def age_appropriate?(classroom, age)
+  if classroom.nil?
+    return true
+  end
+
+  case classroom['level']
+    when '0-1.5'
+      age >= to_age(years: 0, months: 0) && age <= to_age(years: 1, months: 6)
+    when '1.5-3', '0-3'
+      age > to_age(years: 1, months: 6) && age <= to_age(years: 3)
+    when '3-6'
+      age > to_age(years: 3, months: 0) && age <= to_age(years: 6)
+    when '6-9'
+      age > to_age(years: 6, months: 0) && age <= to_age(years: 9)
+    when '6-12'
+      age > to_age(years: 6, months: 0) && age <= to_age(years: 12)
+    when '9-12'
+      age > to_age(years: 9, months: 0) && age <= to_age(years: 12)
+    when '12-15'
+      age > to_age(years: 12, months: 0) && age <= to_age(years: 15)
+    else
+      puts "don't know how to handle level #{classroom['level']}".red
+      true
+  end
+end
+
 def too_old?(classroom, age)
   if classroom.nil?
     return false
@@ -163,6 +201,7 @@ def get_child_active_classroom(child)
       # notes << "Child in multiple classrooms, defaulting to first in list: #{classrooms_recognized}"
       puts "#{name child} is in multiple recognized classrooms: #{classrooms_recognized}".red
   end
+
   classrooms_recognized.first
 end
 
@@ -211,7 +250,7 @@ tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Dandelion Montessori School' && s['name'] != 'Miramelinda Montessori'}
+#schools.reject! {|s| s['name'] != 'Sweet Pea Montessori'}
 stats = {}
 
 puts '=' * 100
@@ -284,6 +323,9 @@ schools.each do |school|
   puts '-' * 100
   school['classrooms_by_id'] = load_classrooms_by_id(tc, school)
   puts "Loaded #{school['classrooms_by_id'].count} classrooms"
+  school['classrooms_by_id'].each do |_, classroom|
+    puts "(#{classroom['id']}) #{classroom['name']} - #{classroom['level']}"
+  end
 
   puts
   puts "Loading Children for #{PREVIOUS_YEAR}"
@@ -456,6 +498,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     "Enrolled at Different School in #{CURRENT_YEAR}",
     "Matched Child ID",
     "Aging out of level",
+    "Age Appropriate for School in #{CURRENT_YEAR}",
     "Ignored",
     'Notes',
   ]
@@ -470,11 +513,13 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     previous_year = school['previous_year']
 
     stats[school['id']] = school_stats = {
-      graduated: [],
+      graduated_school: [],
+      graduated_school_and_continued_in_network: [],
       continued: [],
       continued_at_school: [],
       continued_in_network: [],
-      dropped: [],
+      dropped_school: [],
+      dropped_school_and_continued_in_network: [],
       enrolledCurrentYear: current_year['children'].reject{ |c| is_child_ignored(c) },
       enrolledPreviousYear: previous_year['children'].reject{ |c| is_child_ignored(c) },
     }
@@ -526,6 +571,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         is_continued_at_different_school,
         current_year_child_match_id,
         too_old?(classroom, age_on(child, start_date)) ? 'Y' : 'N',
+        age_appropriate_for_school?(school, age_on(child, start_date)),
         ignored ? 'Y' : 'N',
         notes.join("\n"),
       ]
@@ -535,9 +581,14 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         next
       end
 
-      is_graduated = too_old?(classroom, age_on(child, start_date))
-      if is_graduated
-        school_stats[:graduated] << child
+      # too_old?(classroom, age_on(child, start_date)) && !is_continued_at_current_school
+      graduated_school = !age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
+      if graduated_school
+        school_stats[:graduated_school] << child
+      end
+
+      if graduated_school && is_currently_enrolled_in_network
+        school_stats[:graduated_school_and_continued_in_network] << child
       end
 
       if is_continued_at_current_school || is_currently_enrolled_in_network
@@ -548,8 +599,15 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         else
           school_stats[:continued_in_network] << child
         end
-      elsif not is_graduated
-        school_stats[:dropped] << child
+      end
+
+      dropped_school = age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
+      if dropped_school
+        school_stats[:dropped_school] << child
+      end
+
+      if dropped_school && is_currently_enrolled_in_network
+        school_stats[:dropped_school_and_continued_in_network] << child
       end
     end
   end
@@ -564,18 +622,20 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     'School',
     "#{PREVIOUS_YEAR} Total Children",
     "#{CURRENT_YEAR} Total Children",
-    'Graduated',
+    'Graduated from School',
+    'Graduated from School and Continued in Network',
     'Continued',
     'Continued at School',
     'Continued in Network',
-    'Dropped',
+    'Dropped School',
+    'Dropped School and Continued in Network',
     'Retention Rate',
     'Notes',
   ]
   stats.each do |school_id, school_stats|
     school = schools.find{ |s| s['id'] == school_id }
-    tp, tc, g, c, cs, cn, d = school_stats[:enrolledPreviousYear].length, school_stats[:enrolledCurrentYear].length, school_stats[:graduated].length, school_stats[:continued].length,  school_stats[:continued_at_school].length, school_stats[:continued_in_network].length, school_stats[:dropped].length
-    row = [school['name'], tp, tc, g, c, cs, cn, d] #, school_stats[:dropped_school].length, school_stats[:dropped_network].length
+    tp, tc, gs, gsc, c, cs, cn, ds, dsc = school_stats[:enrolledPreviousYear].length, school_stats[:enrolledCurrentYear].length, school_stats[:graduated_school].length, school_stats[:graduated_school_and_continued_in_network].length, school_stats[:continued].length,  school_stats[:continued_at_school].length, school_stats[:continued_in_network].length, school_stats[:dropped_school].length, school_stats[:dropped_school_and_continued_in_network].length
+    row = [school['name'], tp, tc, gs, gsc, c, cs, cn, ds, dsc] #, school_stats[:dropped_school].length, school_stats[:dropped_network].length
     notes = []
 
     ignored = false
@@ -601,11 +661,11 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     if ignored
       row << nil
       puts "#{school['name']} not enough session/children data: #{notes.join(', ')}"
-    elsif (cs + d) > 0 # Computing retention rate at school specifically, i.e. not considering when child continues in network
-      rate = (cs * 100) / (cs + d)
+    elsif (cs + ds) > 0 # Computing retention rate at school specifically, i.e. not considering when child continues in network
+      rate = (cs * 100) / (cs + ds)
       row << "#{rate}%"
       puts "#{school['name']} => #{rate}% #{notes.join(', ')}"
-    elsif g + c + d == 0
+    elsif gs + c + ds == 0
       raw << "100%"
     else
       row << nil
@@ -628,12 +688,15 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     'Number Schools',
     "#{PREVIOUS_YEAR} Total Children",
     "#{CURRENT_YEAR} Total Children",
-    'Graduated',
+    'Graduated from School',
+    'Graduated from School and Continued in Network',
     'Continued',
     'Continued at School',
     'Continued in Network',
-    'Dropped',
-    'Retention Rate',
+    'Dropped School',
+    'Dropped School and Continued in Network',
+    'Retention Rate (schools)',
+    'Retention Rate (network)',
     'Notes',
   ]
 
@@ -676,7 +739,7 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       school
     end.compact
 
-    group_stats = {tp:0, tc: 0, g: 0, c: 0, cs: 0, cn: 0, d:0}
+    group_stats = {tp:0, tc: 0, gs: 0, gsc: 0, c: 0, cs: 0, cn: 0, ds:0, dsc: 0}
     group_schools.each do |school|
       school_stats = stats[school['id']]
 
@@ -695,17 +758,28 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
 
       group_stats[:tp] += school_stats[:enrolledPreviousYear].length
       group_stats[:tc] += school_stats[:enrolledCurrentYear].length
-      group_stats[:g] += school_stats[:graduated].length
+      group_stats[:gs] += school_stats[:graduated_school].length
+      group_stats[:gsc] += school_stats[:graduated_school_and_continued_in_network].length
       group_stats[:c] += school_stats[:continued].length
       group_stats[:cs] += school_stats[:continued_at_school].length
       group_stats[:cn] += school_stats[:continued_in_network].length
-      group_stats[:d] += school_stats[:dropped].length
+      group_stats[:ds] += school_stats[:dropped_school].length
+      group_stats[:dsc] += school_stats[:dropped_school_and_continued_in_network].length
     end
 
-    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:g], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:d]]
+    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:gs], group_stats[:gsc], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:ds], group_stats[:dsc]]
 
-    if group_stats[:c] + group_stats[:d] > 0 # computing retention within network (i.e. considering it valid if child is re)
-      rate = group_stats[:c] * 100 / (group_stats[:c] + group_stats[:d])
+    if (group_stats[:cs] + group_stats[:ds]) > 0 # computing avg. school retention rate (not considering retention within network)
+      rate = group_stats[:cs] * 100 / (group_stats[:cs] + group_stats[:ds])
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}% #{notes.join(', ')}"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data: #{notes.join(', ')}"
+    end
+
+    if (group_stats[:c] + group_stats[:ds] - group_stats[:dsc]) > 0 # computing network retention rate (taking into account retention within network)
+      rate = group_stats[:c] * 100 / (group_stats[:c] + group_stats[:ds] - group_stats[:dsc])
       row << "#{rate}%"
       puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}% #{notes.join(', ')}"
     else
