@@ -26,21 +26,59 @@ rescue
   }
 end
 
+def date_from_year_and_month_day(year, month_day)
+  Date.parse("#{year}/#{month_day}")
+end
+
+def is_school_ignored(school_id, school_name=nil)
+  isSchoolIgnored = CONFIG['ignoreSchools'].any? do |ignore|
+    school_id == ignore['id'] || (school_name != nil && school_name == ignore['name'])
+  end
+
+  isSchoolIgnored
+end
+
+def is_classroom_ignored(school_id, classroom_id, school_name=nil, classroom_name=nil)
+  isClassroomIgnored = CONFIG['ignoreClassrooms'].any? do |ignore|
+    if ignore['schoolId'] == school_id || (school_name != nil && ignore['schoolName'] == school_name)
+      ignore['classrooms'].any? do |ignoreClassroom|
+        ignoreClassroom['id'] == classroom_id || (classroom_name != nil && ignoreClassroom['name'] == classroom_name)
+      end
+    end
+  end
+
+  isClassroomIgnored
+end
+
+def is_child_ignored(school_id, classroom_ids, child_id, school_name=nil, classroom_names=nil, child_name)
+  is_child_school_ignored = is_school_ignored(school_id, school_name)
+
+  are_all_child_classrooms_ignored = classroom_ids.all? do |classroom_id|
+    is_classroom_ignored(school_id, classroom_id, school_name)
+  end
+
+  is_child_explicitly_ignored = CONFIG['ignoreChildren'].any? do |ignore|
+    if ignore['schoolId'] == school_id or ignore['schoolName'] == school_name
+      ignore['children'].any? do |ignoreChildren|
+        ignoreChildren['id'] == child_id || ignoreChildren['name'] == child_name
+      end
+    end
+  end
+
+  is_child_school_ignored || are_all_child_classrooms_ignored || is_child_explicitly_ignored
+end
+
 def load_schools(tc)
   schools = tc.get 'schools.json'
+
   schools.reject! do |school|
     CONFIG['rejectSchools'].any? do |ignore|
       school['name'] == ignore['name'] || school['id'] == ignore['id']
     end
   end
-  schools.each do |school|
-    school['ignore'] = false
 
-    CONFIG['ignoreSchools'].any? do |ignore|
-      if school['name'] == ignore['name'] or school['id'] == ignore['id']
-        school['ignore'] = true
-      end
-    end
+  schools.each do |school|
+    school['ignore'] = is_school_ignored(school['id'], school['name'])
   end
   schools
 end
@@ -48,19 +86,9 @@ end
 def load_classrooms_by_id(tc, school)
   tc.school_id = school['id']
 
-  classrooms = tc.get 'classrooms.json'
+  classrooms = tc.get('classrooms.json', params: {show_inactive: true})
   classrooms.each do |c|
-    c['ignore'] = false
-
-    CONFIG['ignoreClassrooms'].any? do |ignore|
-      if ignore['schoolId'] == school['id'] or ignore['schoolName'] == school['name']
-        ignore['classrooms'].any? do |ignoreClassroom|
-          if ignoreClassroom['id'] == c['id'] || ignoreClassroom['name'] == c['name']
-            c['ignore'] = true
-          end
-        end
-      end
-    end
+    c['ignore'] = is_classroom_ignored(school['id'], c['id'], school['name'], c['name'])
   end
 
   classrooms.index_by { |c| c['id'] }
@@ -70,23 +98,32 @@ def load_children(tc, school, session)
   tc.school_id = school['id']
 
   children = tc.get 'children.json', params: { session_id: session['id'] }
-  children.each { |c| c['school'] = school['name'] }
+  children.each { |child| child['school'] = school['name'] }
 
-  children.each do |c|
-    c['ignore'] = false
-
-    CONFIG['ignoreChildren'].any? do |ignore|
-      if ignore['schoolId'] == school['id'] or ignore['schoolName'] == school['name']
-        ignore['children'].any? do |ignoreChildren|
-          if ignoreChildren['id'] == c['id'] || ignoreChildren['name'] == c['name']
-            c['ignore'] = true
-          end
-        end
-      end
-    end
+  children.each do |child|
+    child['ignore'] = is_child_ignored(
+        school_id=school['id'],
+        classroom_ids=child['classroom_ids'],
+        child_id=child['id'],
+        school_name=school['name'],
+        classroom_names=nil,
+        child_name=name(child))
   end
 
   children
+end
+
+# TC's classrooms endpoint doesn't return 'inactive' classrooms, but the child endpoint will return classroom_ids that point to these 'inactive' classrooms
+# This means we can't load classroom objects for all the classrooms a child might be linked to
+# This function returns a synthetic classroom, it includes an 'ignore' attribute which checks against the classrooms that have been ignored in the config file
+def unknown_classroom_object(school_id, classroom_id)
+  level = 'unknown'
+  # Temp Patch until Classrooms endpoint gives us "inactive" classroom data
+  if classroom_id == 837
+    level = '1.5-3'
+  end
+
+  {'id'=>classroom_id, 'name'=>"UNKNOWN (#{classroom_id})", 'level'=>level, 'ignore'=>is_classroom_ignored(school_id, classroom_id)}
 end
 
 def fingerprint(child)
@@ -111,11 +148,22 @@ def to_age(years:, months: 0)
   years * 12 + months
 end
 
+# Check if child will turn 5 at some point between start of previous school year through start of next school
+def is_child_kindergarten_eligible?(child, previous_year_start, current_year_start)
+  age_on(child, previous_year_start) < to_age(years: 5, months: 0) && age_on(child, current_year_start) >= to_age(years: 5, months: 0)
+end
+
 def age_appropriate_for_school?(school, age)
   classrooms_by_id = school['classrooms_by_id']
 
   age_appropriate = false
+
   classrooms_by_id.each do |id, classroom|
+    # skip this classroom if it can't be found or if the classroom is in the ignored list
+    if classroom == nil || is_classroom_ignored(school['id'], id, school['name'], classroom['name'])
+      next
+    end
+
     age_appropriate = age_appropriate?(classroom, age)
     break if age_appropriate
   end
@@ -130,22 +178,38 @@ def age_appropriate?(classroom, age)
 
   case classroom['level']
     when '0-1.5'
-      age >= to_age(years: 0, months: 0) && age <= to_age(years: 1, months: 6)
-    when '1.5-3', '0-3'
-      age > to_age(years: 1, months: 6) && age <= to_age(years: 3)
-    when '3-6'
-      age > to_age(years: 3, months: 0) && age <= to_age(years: 6)
+      age >= to_age(years: 0, months: 0) && age < to_age(years: 1, months: 6)
+    when '1.5-3', '0-3' # Cutoff age for aging out of toddler is 33 months
+      age >= to_age(years: 1, months: 6) && age < to_age(years: 2, months: 9)
+    when '3-6' # Entry age for primary is 33 months
+      age >= to_age(years: 2, months: 9) && age < to_age(years: 6)
     when '6-9'
-      age > to_age(years: 6, months: 0) && age <= to_age(years: 9)
+      age >= to_age(years: 6, months: 0) && age < to_age(years: 9)
     when '6-12'
-      age > to_age(years: 6, months: 0) && age <= to_age(years: 12)
+      age >= to_age(years: 6, months: 0) && age < to_age(years: 12)
     when '9-12'
-      age > to_age(years: 9, months: 0) && age <= to_age(years: 12)
+      age >= to_age(years: 9, months: 0) && age < to_age(years: 12)
     when '12-15'
-      age > to_age(years: 12, months: 0) && age <= to_age(years: 15)
+      age >= to_age(years: 12, months: 0) && age < to_age(years: 15)
     else
       puts "don't know how to handle level #{classroom['level']}".red
       true
+  end
+end
+
+def infant_toddler_classroom?(classroom)
+  if classroom.nil?
+    return false
+  end
+
+  case classroom['level']
+  when '0-1.5', '1.5-3', '0-3'
+    true
+  when '3-6', '6-9', '6-12', '9-12', '12-15'
+    false
+  else
+    puts "infant_toddler_classroom? - don't know how to handle level #{classroom['level']}".red
+    false
   end
 end
 
@@ -157,9 +221,9 @@ def too_old?(classroom, age)
   case classroom['level']
     when '0-1.5'
       age >= to_age(years: 1, months: 6)
-    when '1.5-3', '0-3'
-      age >= to_age(years: 3)
-    when '3-6'
+    when '1.5-3', '0-3' # Cutoff age for aging out of toddler is 33 months
+      age >= to_age(years: 2, months: 9)
+    when '3-6' # Entry age for primary is 33 months
       age >= to_age(years: 6)
     when '6-9'
       age >= to_age(years: 9)
@@ -170,7 +234,7 @@ def too_old?(classroom, age)
     when '12-15'
       age >= to_age(years: 15)
     else
-      puts "don't know how to handle level #{classroom['level']}".red
+      puts "too_old? - don't know how to handle level #{classroom['level']}".red
       false
   end
 end
@@ -185,12 +249,18 @@ def new_school_year
 end
 
 def get_child_recognized_classrooms(child)
-  classrooms = child['classroom_ids'].map { |id| child['school']['classrooms_by_id'][id] }.compact
+  classrooms = child['classroom_ids'].map do |id|
+    child['school']['classrooms_by_id'][id] || unknown_classroom_object(child['school']['id'], id)
+  end.compact
+
   classrooms.reject {|c| c['ignore']}
 end
 
 def get_child_ignored_classrooms(child)
-  classrooms = child['classroom_ids'].map { |id| child['school']['classrooms_by_id'][id] }.compact
+  classrooms = child['classroom_ids'].map do |id|
+    child['school']['classrooms_by_id'][id] || unknown_classroom_object(child['school']['id'], id)
+  end.compact
+
   classrooms.select {|c| c['ignore']}
 end
 
@@ -216,9 +286,15 @@ def child_ignored_list(child)
   }
 end
 
-def is_child_ignored(child)
-  child_ignored_list(child).values.reduce(false) { |agg, reason| agg || reason }
+def is_child_in_infant_toddler_classroom?(child)
+  classroom = get_child_active_classroom(child)
+
+  infant_toddler_classroom?(classroom)
 end
+
+# def is_child_ignored(child)
+#   child_ignored_list(child).values.reduce(false) { |agg, reason| agg || reason }
+# end
 
 def reasons_child_ignored_details(child)
   details = []
@@ -250,7 +326,7 @@ tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Sweet Pea Montessori'}
+#schools.reject! {|s| s['name'] != 'Acorn Montessori'}
 stats = {}
 
 puts '=' * 100
@@ -268,12 +344,8 @@ schools.each do |school|
   load_sessions_for_school_year = lambda do |school_year|
     results = new_school_year.slice('sessions', 'start_date', 'stop_date')
 
-    parse_date_from_year_and_day = lambda do |split_year, day|
-      return Date.parse("#{split_year}/#{day}")
-    end
-
-    latest_start = parse_date_from_year_and_day.call(school_year.split('-')[0], SCHOOL_YEAR_LATEST_START)
-    earliest_stop = parse_date_from_year_and_day.call(school_year.split('-')[1], SCHOOL_YEAR_EARLIEST_STOP)
+    latest_start = date_from_year_and_month_day(school_year.split('-')[0], SCHOOL_YEAR_LATEST_START)
+    earliest_stop = date_from_year_and_month_day(school_year.split('-')[1], SCHOOL_YEAR_EARLIEST_STOP)
 
     sessions = tc.find_sessions_by_school_year(
         latest_start:    latest_start,
@@ -324,7 +396,7 @@ schools.each do |school|
   school['classrooms_by_id'] = load_classrooms_by_id(tc, school)
   puts "Loaded #{school['classrooms_by_id'].count} classrooms"
   school['classrooms_by_id'].each do |_, classroom|
-    puts "(#{classroom['id']}) #{classroom['name']} - #{classroom['level']}"
+    puts "(#{classroom['id']}) #{classroom['name']} - #{classroom['level']}, active: #{classroom['active']}"
   end
 
   puts
@@ -358,11 +430,12 @@ schools.each do |school|
 end
 
 def does_children_collection_include(children, child)
-  if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
+  # if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
+  if children.has_key?(child['fingerprint']) && not(children[child['fingerprint']]['ignore'])
     return [true, children[child['fingerprint']]]
   end
 
-  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(is_child_ignored(c)) }
+  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(c['ignore']) }
   if children_with_birthdate.empty?
     return [false, nil]
   end
@@ -404,8 +477,9 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
     'Ethnicity',
     'Household Income',
     'Dominant Language',
-    'Classroom',
-    'Level',
+    "Classroom in #{CURRENT_YEAR}",
+    "Level in #{CURRENT_YEAR}",
+    "In Infant/Toddler Classroom in #{CURRENT_YEAR}",
     "Start of #{CURRENT_YEAR}",
     "End of #{CURRENT_YEAR}",
     "Age at Start of #{CURRENT_YEAR}",
@@ -432,7 +506,7 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
     current_year['children'].each do |child|
       notes = []
 
-      ignored = is_child_ignored(child)
+      ignored = child['ignore']
       if ignored
         notes.concat(reasons_child_ignored_details(child))
       end
@@ -448,7 +522,8 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
         notes << "Matched with previous year child - id: #{previous_year_child_match_id} name: #{name(previous_year_child_match)}"
       end
 
-      was_previously_at_current_school = previous_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(is_child_ignored(c))}
+      # was_previously_at_current_school = previous_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(c['ignore'])}
+      was_previously_at_current_school = was_previously_enrolled_in_network && child['school']['id'] == previous_year_child_match['school']['id']
       was_previously_at_different_school = was_previously_enrolled_in_network && not(was_previously_at_current_school)
 
       csv << [
@@ -462,6 +537,7 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
           child['dominant_language'],
           classroom ? classroom['name'] : nil,
           classroom ? classroom['level'] : nil,
+          is_child_in_infant_toddler_classroom?(child),
           start_date,
           stop_date,
           format_age(age_on(child, start_date)),
@@ -488,8 +564,9 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     'Ethnicity',
     'Household Income',
     'Dominant Language',
-    'Classroom',
-    'Level',
+    "Classroom in #{PREVIOUS_YEAR}",
+    "Level in #{PREVIOUS_YEAR}",
+    "In Infant/Toddler Classroom in #{PREVIOUS_YEAR}",
     "Start of #{CURRENT_YEAR}",
     "Age at Start of #{CURRENT_YEAR}",
     "Age in Months at Start of #{CURRENT_YEAR}",
@@ -497,9 +574,14 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     "Enrolled in #{CURRENT_YEAR}",
     "Enrolled at Different School in #{CURRENT_YEAR}",
     "Matched Child ID",
-    "Aging out of level",
+    "Aging out of Level",
     "Age Appropriate for School in #{CURRENT_YEAR}",
-    "Ignored",
+    "Graduated School",
+    "Continued School",
+    "Continued Network",
+    "Dropped School",
+    'Kindergarten Eligible Year',
+    'Ignored',
     'Notes',
   ]
 
@@ -518,10 +600,22 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       continued: [],
       continued_at_school: [],
       continued_in_network: [],
+      continued_at_school_kindergarten: [],
+      continued_in_network_kindergarten: [],
+      continued_at_school_infant_toddler: [],
+      continued_in_network_infant_toddler: [],
+      continued_at_school_kindergarten_or_infant_toddler: [],
+      continued_in_network_kindergarten_or_infant_toddler: [],
       dropped_school: [],
-      dropped_school_and_continued_in_network: [],
-      enrolledCurrentYear: current_year['children'].reject{ |c| is_child_ignored(c) },
-      enrolledPreviousYear: previous_year['children'].reject{ |c| is_child_ignored(c) },
+      dropped_school_but_continued_in_network: [],
+      dropped_school_kindergarten: [],
+      dropped_school_but_continued_in_network_kindergarten: [],
+      dropped_school_infant_toddler: [],
+      dropped_school_but_continued_in_network_infant_toddler: [],
+      dropped_school_kindergarten_or_infant_toddler: [],
+      dropped_school_but_continued_in_network_kindergarten_or_infant_toddler: [],
+      enrolled_current_year: current_year['children'].reject{ |c| c['ignore'] },
+      enrolled_previous_year: previous_year['children'].reject{ |c| c['ignore'] },
     }
 
     next if previous_year['children'].empty?
@@ -533,10 +627,12 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     previous_year['children'].each do |child|
       notes = []
 
-      ignored = is_child_ignored(child)
+      ignored = child['ignore']
       if ignored
         notes.concat(reasons_child_ignored_details(child))
       end
+      is_child_kindergarten_eligible = is_child_kindergarten_eligible?(child, Date.parse(previous_year['start_date']), Date.parse(current_year['start_date']))
+      in_infant_toddler_classroom = is_child_in_infant_toddler_classroom?(child)
 
       classroom = get_child_active_classroom(child)
 
@@ -549,8 +645,12 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         notes << "Matched with current year child - id: #{current_year_child_match_id} name: #{name(current_year_child_match)}"
       end
 
-      is_continued_at_current_school = current_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(is_child_ignored(c))}
+      #is_continued_at_current_school = current_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(c['ignore'])}
+      is_continued_at_current_school = is_currently_enrolled_in_network && child['school']['id'] == current_year_child_match['school']['id']
       is_continued_at_different_school = is_currently_enrolled_in_network && not(is_continued_at_current_school)
+
+      graduated_school = !age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
+      dropped_school = age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
 
       csv << [
         child['id'],
@@ -563,6 +663,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         child['dominant_language'],
         classroom ? classroom['name'] : nil,
         classroom ? classroom['level'] : nil,
+        in_infant_toddler_classroom,
         start_date,
         format_age(age_on(child, start_date)),
         age_on(child, start_date),
@@ -572,6 +673,11 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         current_year_child_match_id,
         too_old?(classroom, age_on(child, start_date)) ? 'Y' : 'N',
         age_appropriate_for_school?(school, age_on(child, start_date)),
+        graduated_school,
+        is_continued_at_current_school,
+        is_currently_enrolled_in_network,
+        dropped_school,
+        is_child_kindergarten_eligible,
         ignored ? 'Y' : 'N',
         notes.join("\n"),
       ]
@@ -582,7 +688,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       end
 
       # too_old?(classroom, age_on(child, start_date)) && !is_continued_at_current_school
-      graduated_school = !age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
+
       if graduated_school
         school_stats[:graduated_school] << child
       end
@@ -596,18 +702,65 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
 
         if is_continued_at_current_school
           school_stats[:continued_at_school] << child
+
+          if is_child_kindergarten_eligible
+            school_stats[:continued_at_school_kindergarten] << child
+          end
+
+          if in_infant_toddler_classroom
+            school_stats[:continued_at_school_infant_toddler] << child
+          end
+
+          if is_child_kindergarten_eligible || in_infant_toddler_classroom
+            school_stats[:continued_at_school_kindergarten_or_infant_toddler] << child
+          end
         else
           school_stats[:continued_in_network] << child
+
+          if is_child_kindergarten_eligible
+            school_stats[:continued_in_network_kindergarten] << child
+          end
+
+          if in_infant_toddler_classroom
+            school_stats[:continued_in_network_infant_toddler] << child
+          end
+
+          if is_child_kindergarten_eligible || in_infant_toddler_classroom
+            school_stats[:continued_in_network_kindergarten_or_infant_toddler] << child
+          end
         end
       end
 
-      dropped_school = age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
       if dropped_school
         school_stats[:dropped_school] << child
-      end
 
-      if dropped_school && is_currently_enrolled_in_network
-        school_stats[:dropped_school_and_continued_in_network] << child
+        if is_child_kindergarten_eligible
+          school_stats[:dropped_school_kindergarten] << child
+        end
+
+        if in_infant_toddler_classroom
+          school_stats[:dropped_school_infant_toddler] << child
+        end
+
+        if is_child_kindergarten_eligible || in_infant_toddler_classroom
+          school_stats[:dropped_school_kindergarten_or_infant_toddler] << child
+        end
+
+        if is_currently_enrolled_in_network
+          school_stats[:dropped_school_but_continued_in_network] << child
+
+          if is_child_kindergarten_eligible
+            school_stats[:dropped_school_but_continued_in_network_kindergarten] << child
+          end
+
+          if in_infant_toddler_classroom
+            school_stats[:dropped_school_but_continued_in_network_infant_toddler] << child
+          end
+
+          if is_child_kindergarten_eligible || in_infant_toddler_classroom
+            school_stats[:dropped_school_but_continued_in_network_kindergarten_or_infant_toddler] << child
+          end
+        end
       end
     end
   end
@@ -627,15 +780,40 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     'Continued',
     'Continued at School',
     'Continued in Network',
+    'Continued at School (Kindergarten Eligible)',
+    'Continued in Network (Kindergarten Eligible)',
+    'Continued at School (Infant/Toddler Classroom)',
+    'Continued in Network (Infant/Toddler Classroom)',
+    'Continued at School (Kindergarten & Infant/Toddler Classroom)',
+    'Continued in Network (Kindergarten & Infant/Toddler Classroom)',
     'Dropped School',
-    'Dropped School and Continued in Network',
+    'Dropped School but Continued in Network',
+    'Dropped School (Kindergarten Eligible)',
+    'Dropped School but Continued in Network (Kindergarten Eligible)',
+    'Dropped School (Infant/Toddler Classroom)',
+    'Dropped School but Continued in Network (Infant/Toddler Classroom)',
+    'Dropped School (Kindergarten & Infant/Toddler Classroom)',
+    'Dropped School but Continued in Network (Kindergarten & Infant/Toddler Classroom)',
     'Retention Rate',
+    'Retention Rate (Ignoring Kindergarten Eligible)',
+    'Retention Rate (Ignoring Infant/Toddler Classroom)',
+    'Retention Rate (Ignoring Kindergarten Eligible & Infant/Toddler Classroom)',
     'Notes',
   ]
   stats.each do |school_id, school_stats|
     school = schools.find{ |s| s['id'] == school_id }
-    tp, tc, gs, gsc, c, cs, cn, ds, dsc = school_stats[:enrolledPreviousYear].length, school_stats[:enrolledCurrentYear].length, school_stats[:graduated_school].length, school_stats[:graduated_school_and_continued_in_network].length, school_stats[:continued].length,  school_stats[:continued_at_school].length, school_stats[:continued_in_network].length, school_stats[:dropped_school].length, school_stats[:dropped_school_and_continued_in_network].length
-    row = [school['name'], tp, tc, gs, gsc, c, cs, cn, ds, dsc] #, school_stats[:dropped_school].length, school_stats[:dropped_network].length
+    tp, tc = school_stats[:enrolled_previous_year].length, school_stats[:enrolled_current_year].length
+    gs, gsc = school_stats[:graduated_school].length, school_stats[:graduated_school_and_continued_in_network].length
+    c = school_stats[:continued].length
+    cs, cn = school_stats[:continued_at_school].length, school_stats[:continued_in_network].length
+    csk, cnk = school_stats[:continued_at_school_kindergarten].length, school_stats[:continued_in_network_kindergarten].length
+    csit, cnit = school_stats[:continued_at_school_infant_toddler].length, school_stats[:continued_in_network_infant_toddler].length
+    cskit, cnkit = school_stats[:continued_at_school_kindergarten_or_infant_toddler].length, school_stats[:continued_in_network_kindergarten_or_infant_toddler].length
+    ds, dscn = school_stats[:dropped_school].length, school_stats[:dropped_school_but_continued_in_network].length
+    dsk, dscnk = school_stats[:dropped_school_kindergarten].length, school_stats[:dropped_school_but_continued_in_network_kindergarten].length
+    dsit, dscnit = school_stats[:dropped_school_infant_toddler].length, school_stats[:dropped_school_but_continued_in_network_infant_toddler].length
+    dskit, dscnkit = school_stats[:dropped_school_kindergarten_or_infant_toddler].length, school_stats[:dropped_school_but_continued_in_network_kindergarten_or_infant_toddler].length
+    row = [school['name'], tp, tc, gs, gsc, c, cs, cn, csk, cnk, csit, cnit, cskit, cnkit, ds, dscn, dsk, dscnk, dsit, dscnit, dskit, dscnkit]
     notes = []
 
     ignored = false
@@ -659,16 +837,46 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     end
 
     if ignored
-      row << nil
+      row.concat(Array.new(4, nil))
       puts "#{school['name']} not enough session/children data: #{notes.join(', ')}"
     elsif (cs + ds) > 0 # Computing retention rate at school specifically, i.e. not considering when child continues in network
-      rate = (cs * 100) / (cs + ds)
+      rate = ((cs * 100.0) / (cs + ds)).round
       row << "#{rate}%"
       puts "#{school['name']} => #{rate}% #{notes.join(', ')}"
+
+      # Kindergarten retention
+      if (cs - csk + ds - dsk) > 0
+        krate = (((cs - csk) * 100.0) / (cs - csk + ds - dsk)).round
+        row << "#{krate}%"
+        puts "#{school['name']} Kindergarten Rate => #{krate}%"
+      else
+        #row << "100%"
+        row << nil
+      end
+
+      # Infant Toddler retention
+      if (cs - csit + ds - dsit) > 0
+        itrate = (((cs - csit) * 100.0) / (cs - csit + ds - dsit)).round
+        row << "#{itrate}%"
+        puts "#{school['name']} Infant/Toddler Rate => #{itrate}%"
+      else
+        #row << "100%"
+        row << nil
+      end
+
+      # Kindergarten or Infant Toddler retention
+      if (cs - cskit + ds - dskit) > 0
+        kitrate = (((cs - cskit) * 100.0) / (cs - cskit + ds - dskit)).round
+        row << "#{kitrate}%"
+        puts "#{school['name']} Infant/Toddler Rate => #{kitrate}%"
+      else
+        #row << "100%"
+        row << nil
+      end
     elsif gs + c + ds == 0
-      raw << "100%"
+      row.concat(Array.new(4, "100%"))
     else
-      row << nil
+      row.concat(Array.new(4, nil))
       puts "#{school['name']} not enough statistical data"
     end
 
@@ -693,10 +901,28 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     'Continued',
     'Continued at School',
     'Continued in Network',
+    'Continued at School (Kindergarten Eligible)',
+    'Continued in Network (Kindergarten Eligible)',
+    'Continued at School (Infant/Toddler Eligible)',
+    'Continued in Network (Infant/Toddler Eligible)',
+    'Continued at School (Kindergarten or Infant/Toddler Eligible)',
+    'Continued in Network (Kindergarten or Infant/Toddler Eligible)',
     'Dropped School',
-    'Dropped School and Continued in Network',
+    'Dropped School but Continued in Network',
+    'Dropped School (Kindergarten Eligible)',
+    'Dropped School but Continued in Network (Kindergarten Eligible)',
+    'Dropped School (Infant/Toddler Classroom)',
+    'Dropped School but Continued in Network (Infant/Toddler Classrooms)',
+    'Dropped School (Kindergarten or Infant/Toddler Classroom)',
+    'Dropped School but Continued in Network (Kindergarten or Infant/Toddler Classrooms)',
     'Retention Rate (schools)',
+    'Retention Rate (schools: Ignoring Kindergarten Eligible)',
+    'Retention Rate (schools: Ignoring Toddler/Infant Classrooms)',
+    'Retention Rate (schools: Ignoring Kindergarten and Toddler/Infant Classrooms)',
     'Retention Rate (network)',
+    'Retention Rate (network: Ignoring Kindergarten Eligible)',
+    'Retention Rate (network: Ignoring Toddler/Infant Classrooms)',
+    'Retention Rate (network: Ignoring Kindergarten and Toddler/Infant Classrooms)',
     'Notes',
   ]
 
@@ -739,7 +965,7 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       school
     end.compact
 
-    group_stats = {tp:0, tc: 0, gs: 0, gsc: 0, c: 0, cs: 0, cn: 0, ds:0, dsc: 0}
+    group_stats = {tp:0, tc: 0, gs: 0, gsc: 0, c: 0, cs: 0, cn: 0, csk: 0, cnk: 0, csit: 0, cnit: 0, cskit: 0, cnkit: 0, ds:0, dscn: 0, dsk: 0, dscnk: 0, dsit: 0, dscnit: 0, dskit: 0, dscnkit: 0}
     group_schools.each do |school|
       school_stats = stats[school['id']]
 
@@ -749,43 +975,119 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       if school['current_year']['sessions'].empty?
         notes << "Warning: School '#{school['name']}' has no #{CURRENT_YEAR} session"
       end
-      if school_stats[:enrolledPreviousYear].length == 0
+      if school_stats[:enrolled_previous_year].length == 0
         notes << "Warning: School '#{school['name']}' has no children enrolled in previous year (not including ignored children)"
       end
-      if school_stats[:enrolledCurrentYear].length == 0
+      if school_stats[:enrolled_current_year].length == 0
         notes << "Warning: School '#{school['name']}' has no children enrolled in current year (not including ignored children)"
       end
 
-      group_stats[:tp] += school_stats[:enrolledPreviousYear].length
-      group_stats[:tc] += school_stats[:enrolledCurrentYear].length
+      group_stats[:tp] += school_stats[:enrolled_previous_year].length
+      group_stats[:tc] += school_stats[:enrolled_current_year].length
       group_stats[:gs] += school_stats[:graduated_school].length
       group_stats[:gsc] += school_stats[:graduated_school_and_continued_in_network].length
       group_stats[:c] += school_stats[:continued].length
       group_stats[:cs] += school_stats[:continued_at_school].length
       group_stats[:cn] += school_stats[:continued_in_network].length
+      group_stats[:csk] += school_stats[:continued_at_school_kindergarten].length
+      group_stats[:cnk] += school_stats[:continued_in_network_kindergarten].length
+      group_stats[:csit] += school_stats[:continued_at_school_infant_toddler].length
+      group_stats[:cnit] += school_stats[:continued_in_network_infant_toddler].length
+      group_stats[:cskit] += school_stats[:continued_at_school_kindergarten_or_infant_toddler].length
+      group_stats[:cnkit] += school_stats[:continued_in_network_kindergarten_or_infant_toddler].length
       group_stats[:ds] += school_stats[:dropped_school].length
-      group_stats[:dsc] += school_stats[:dropped_school_and_continued_in_network].length
+      group_stats[:dscn] += school_stats[:dropped_school_but_continued_in_network].length
+      group_stats[:dsk] += school_stats[:dropped_school_kindergarten].length
+      group_stats[:dscnk] += school_stats[:dropped_school_but_continued_in_network_kindergarten].length
+      group_stats[:dsit] += school_stats[:dropped_school_infant_toddler].length
+      group_stats[:dscnit] += school_stats[:dropped_school_but_continued_in_network_infant_toddler].length
+      group_stats[:dskit] += school_stats[:dropped_school_kindergarten_or_infant_toddler].length
+      group_stats[:dscnkit] += school_stats[:dropped_school_but_continued_in_network_kindergarten_or_infant_toddler].length
     end
 
-    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:gs], group_stats[:gsc], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:ds], group_stats[:dsc]]
+    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:gs], group_stats[:gsc], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:csk], group_stats[:cnk], group_stats[:csit], group_stats[:cnit], group_stats[:cskit], group_stats[:cnkit], group_stats[:ds], group_stats[:dscn], group_stats[:dsk], group_stats[:dscnk], group_stats[:dsit], group_stats[:dscnit], group_stats[:dskit], group_stats[:dscnkit]]
 
+    # School retention
     if (group_stats[:cs] + group_stats[:ds]) > 0 # computing avg. school retention rate (not considering retention within network)
-      rate = group_stats[:cs] * 100 / (group_stats[:cs] + group_stats[:ds])
+      rate = (group_stats[:cs] * 100.0 / (group_stats[:cs] + group_stats[:ds])).round
       row << "#{rate}%"
-      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}% #{notes.join(', ')}"
+      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}%"
     else
       row << nil
-      puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data: #{notes.join(', ')}"
+      puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data"
     end
 
-    if (group_stats[:c] + group_stats[:ds] - group_stats[:dsc]) > 0 # computing network retention rate (taking into account retention within network)
-      rate = group_stats[:c] * 100 / (group_stats[:c] + group_stats[:ds] - group_stats[:dsc])
+    # School retention ignoring Kindergarten
+    if (group_stats[:cs] - group_stats[:csk] + group_stats[:ds] - group_stats[:dsk]) > 0
+      rate = ((group_stats[:cs] - group_stats[:csk]) * 100.0 / (group_stats[:cs] - group_stats[:csk] + group_stats[:ds] - group_stats[:dsk])).round
       row << "#{rate}%"
-      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}% #{notes.join(', ')}"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten => #{rate}%"
     else
       row << nil
-      puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data: #{notes.join(', ')}"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten - not enough statistical data"
     end
+
+    # School retention ignoring Infant Toddler
+    if (group_stats[:cs] - group_stats[:csit] + group_stats[:ds] - group_stats[:dsit]) > 0
+      rate = ((group_stats[:cs] - group_stats[:csit]) * 100.0 / (group_stats[:cs] - group_stats[:csit] + group_stats[:ds] - group_stats[:dsit])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Infant/Toddler => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) Infant/Toddler - not enough statistical data"
+    end
+
+    # School retention ignoring Kindergarten and Infant Toddler
+    if (group_stats[:cs] - group_stats[:cskit] + group_stats[:ds] - group_stats[:dskit]) > 0
+      rate = ((group_stats[:cs] - group_stats[:cskit]) * 100.0 / (group_stats[:cs] - group_stats[:cskit] + group_stats[:ds] - group_stats[:dskit])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten and Infant/Toddler => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten and Infant/Toddler - not enough statistical data"
+    end
+
+    # Network retention
+    if (group_stats[:c] + group_stats[:ds] - group_stats[:dscn]) > 0 # computing network retention rate (taking into account retention within network)
+      rate = (group_stats[:c] * 100.0 / (group_stats[:c] + group_stats[:ds] - group_stats[:dscn])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # Network retention ignoring Kindergarten
+    if (group_stats[:c] - group_stats[:csk] - group_stats[:cnk] + group_stats[:ds] - (group_stats[:dscn] - group_stats[:dscnk]) - group_stats[:dsk]) > 0
+      rate = ((group_stats[:c] - group_stats[:csk] - group_stats[:cnk]) * 100.0 / (group_stats[:c] - group_stats[:csk] - group_stats[:cnk] + group_stats[:ds] - (group_stats[:dscn] - group_stats[:dscnk]) - group_stats[:dsk])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten=> #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten - not enough statistical data"
+    end
+
+    # Network retention ignoring Infant Toddler
+    if (group_stats[:c] - group_stats[:csit] - group_stats[:cnit] + group_stats[:ds] - (group_stats[:dscn] - group_stats[:dscnit]) - group_stats[:dsit]) > 0
+      rate = ((group_stats[:c] - group_stats[:csit] - group_stats[:cnit]) * 100.0 / (group_stats[:c] - group_stats[:csit] - group_stats[:cnit] + group_stats[:ds] - (group_stats[:dscn] - group_stats[:dscnit]) - group_stats[:dsit])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Infant/Toddler=> #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) Infant/Toddler - not enough statistical data"
+    end
+
+    # Network retention ignoring Kindergarten and Infant Toddler
+    if (group_stats[:c] - group_stats[:cskit] - group_stats[:cnkit] + group_stats[:ds] - (group_stats[:dscn] - group_stats[:dscnkit]) - group_stats[:dskit]) > 0
+      rate = ((group_stats[:c] - group_stats[:cskit] - group_stats[:cnkit]) * 100.0 / (group_stats[:c] - group_stats[:cskit] - group_stats[:cnkit] + group_stats[:ds] - (group_stats[:dscn] - group_stats[:dscnkit]) - group_stats[:dskit])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten & Infant/Toddler=> #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} (#{gs_config['type']}) Kindergarten & Infant/Toddler - not enough statistical data"
+    end
+
+    puts "#{gs_config['name']} (#{gs_config['type']}) Notes: #{notes.join(', ')}"
 
     row << notes.join("\n")
     csv << row
