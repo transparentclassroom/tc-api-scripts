@@ -5,7 +5,7 @@ require 'colorize'
 module TransparentClassroom
   class Client
     def initialize(api_token: ENV['TC_API_TOKEN'],
-                   base_url: 'https://www.transparentclassroom.com/api/v1',
+                   base_url: ENV['TC_API_BASE_URL'] || 'https://www.transparentclassroom.com/api/v1',
                    school_id: nil,
                    masquerade_id: nil)
       raise "Your api token is blank" if api_token.blank?

@@ -34,3 +34,8 @@ Follow these instructions to run a script using ruby.
 
 1. Run a script ```ruby ./pull_retention_rates.rb```
 
+### Development
+
+Point script to a different TC API endpoint by using the `TC_API_BASE_URL` env var (default: `https://www.transparentclassroom.com/api/v1`):
+
+    export ENV['TC_API_BASE_URL']=http://localhost/api/v1

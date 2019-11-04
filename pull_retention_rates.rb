@@ -118,10 +118,6 @@ end
 # This function returns a synthetic classroom, it includes an 'ignore' attribute which checks against the classrooms that have been ignored in the config file
 def unknown_classroom_object(school_id, classroom_id)
   level = 'unknown'
-  # Temp Patch until Classrooms endpoint gives us "inactive" classroom data
-  if classroom_id == 837
-    level = '1.5-3'
-  end
 
   {'id'=>classroom_id, 'name'=>"UNKNOWN (#{classroom_id})", 'level'=>level, 'ignore'=>is_classroom_ignored(school_id, classroom_id)}
 end
