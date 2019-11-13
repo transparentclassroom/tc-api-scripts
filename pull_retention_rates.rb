@@ -312,17 +312,99 @@ def reasons_child_ignored_details(child)
   details
 end
 
+
+def does_children_collection_include(children, child)
+  # if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
+  if children.has_key?(child['fingerprint']) && not(children[child['fingerprint']]['ignore'])
+    return [true, children[child['fingerprint']]]
+  end
+
+  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(c['ignore']) }
+  if children_with_birthdate.empty?
+    return [false, nil]
+  end
+
+  puts "Performing fuzzy match on #{name(child)}"
+  nearest = children_with_birthdate.map{ |c| {c => NamesMatcher.distance(name(child), name(c))}}.min_by{|r| r.values}
+  match = nearest.values.first <= 0.8
+  if match
+    puts "Found #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
+    return [true, nearest.keys.first]
+  else
+    puts "No match, nearest candidate #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
+    return [false, nil]
+  end
+end
+
+def get_school_from_name(school_name, schools)
+  match = schools.detect do |school|
+    break school if school['name'].strip.downcase == school_name.strip.downcase
+  end
+
+  match
+end
+
+def get_classroom_from_name(classroom_name, schools)
+  classroom = schools.detect do |school|
+    c = school['classrooms_by_id'].detect do |_, classroom|
+      break classroom if classroom['name'].strip.downcase == classroom_name.strip.downcase
+    end
+
+    break c if c
+  end
+
+  classroom
+end
+
+def load_missing_children_from_csv(schools)
+  return [] unless File.file?("missing_children.csv")
+
+  missing = CSV.parse(File.read("missing_children.csv"), headers: true)
+
+  children = missing.map do |raw|
+    child = {
+        'id' => raw['child_id'].to_i,
+        'school' => get_school_from_name(raw['school_name'], schools),
+        'first_name' => raw['first_name'],
+        'last_name' => raw['last_name'],
+        'birth_date' => raw['birth_date'],
+        'ethnicity' => (raw['ethnicity'] || '').split(","),
+        'household_income' => raw['household_income'],
+        'dominant_language' => raw['dominant_language'],
+        'classroom_ids' => raw['classroom_names'].split(",").map{|name| c = get_classroom_from_name(name, schools); c ? c['id'].to_i : nil }.compact,
+        'was_missing' => true
+    }
+    child['fingerprint'] = fingerprint(child)
+
+    child
+  end
+
+  # Scrub records that could not be associated with a school
+  children.reject!{|child| child['school'].nil?}
+
+  children.each do |child|
+    child['ignore'] = is_child_ignored(
+        school_id=child['school']['id'],
+        classroom_ids=child['classroom_ids'],
+        child_id=child['id'],
+        school_name=child['school']['name'],
+        classroom_names=nil,
+        child_name=name(child))
+  end
+
+  children
+end
+
 dir = File.expand_path("output", File.dirname(__FILE__))
 FileUtils.mkdir_p(dir) unless File.directory?(dir)
 
-# tc = TransparentClassroom::Client.new base_url: 'http://localhost:3000/api/v1'
 tc = TransparentClassroom::Client.new
 tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Acorn Montessori'}
+#schools.reject! {|s| s['name'] != 'Tiger Lily Montessori'}
 stats = {}
 
 puts '=' * 100
@@ -411,10 +493,34 @@ schools.each do |school|
 end
 
 puts
+puts "Adding Missing Children to #{PREVIOUS_YEAR}".bold
+puts '=' * 100
+missing_children = load_missing_children_from_csv(schools)
+
+puts
 puts "Organizing Collection of All Children for #{PREVIOUS_YEAR}".bold
 puts '=' * 100
 previous_years_children = {}
 schools.each do |school|
+  fids = school['previous_year']['children'].map do |child|
+    child['fingerprint']
+  end
+
+  child_ids = school['previous_year']['children'].map do |child|
+    child['id']
+  end
+
+  missing_children_for_school = missing_children.find_all do |missing|
+    school['id'] == missing['school']['id']
+  end
+
+  missing_children_for_school.each do |missing|
+    unless fids.include?(missing['fingerprint']) || child_ids.include?(missing['id'])
+      puts "Adding child from missing_children.csv: #{name(missing)} (#{missing['id']}) - #{missing['school']['name']} - #{missing['classroom_ids']}".yellow
+      school['previous_year']['children'] << missing
+    end
+  end
+
   school['previous_year']['children'].each do |child|
     fid = child['fingerprint']
     if previous_years_children.has_key?(fid)
@@ -422,29 +528,6 @@ schools.each do |school|
     else
       previous_years_children[fid] = child
     end
-  end
-end
-
-def does_children_collection_include(children, child)
-  # if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
-  if children.has_key?(child['fingerprint']) && not(children[child['fingerprint']]['ignore'])
-    return [true, children[child['fingerprint']]]
-  end
-
-  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(c['ignore']) }
-  if children_with_birthdate.empty?
-    return [false, nil]
-  end
-
-  puts "Performing fuzzy match on #{name(child)}"
-  nearest = children_with_birthdate.map{ |c| {c => NamesMatcher.distance(name(child), name(c))}}.min_by{|r| r.values}
-  match = nearest.values.first <= 0.8
-  if match
-    puts "Found #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
-    return [true, nearest.keys.first]
-  else
-    puts "No match, nearest candidate #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
-    return [false, nil]
   end
 end
 
@@ -490,7 +573,6 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
   ]
   schools.each do |school|
     current_year = school['current_year']
-    previous_year = school['previous_year']
 
     next if current_year['children'].empty?
 
@@ -542,8 +624,8 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
           was_previously_enrolled_in_network,
           was_previously_at_different_school,
           previous_year_child_match_id,
-          too_old?(classroom, age_on(child, stop_date)) ? 'Y' : 'N',
-          ignored ? 'Y' : 'N',
+          too_old?(classroom, age_on(child, stop_date)),
+          ignored,
           notes.join("\n"),
       ]
     end
@@ -578,6 +660,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     "Dropped School",
     'Kindergarten Eligible Year',
     'Ignored',
+    'Added Manually (previously deleted from TC)',
     'Notes',
   ]
 
@@ -667,14 +750,15 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         is_currently_enrolled_in_network,
         is_continued_at_different_school,
         current_year_child_match_id,
-        too_old?(classroom, age_on(child, start_date)) ? 'Y' : 'N',
+        too_old?(classroom, age_on(child, start_date)),
         age_appropriate_for_school?(school, age_on(child, start_date)),
         graduated_school,
         is_continued_at_current_school,
         is_currently_enrolled_in_network,
         dropped_school,
         is_child_kindergarten_eligible,
-        ignored ? 'Y' : 'N',
+        ignored,
+        child['was_missing'] || false,
         notes.join("\n"),
       ]
 
