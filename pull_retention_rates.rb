@@ -22,6 +22,7 @@ rescue
     'ignoreSchools' => [],
     'ignoreClassrooms' => [],
     'ignoreChildren' => [],
+    'graduatedChildren' => [],
     'groupSchools' => [],
   }
 end
@@ -50,7 +51,7 @@ def is_classroom_ignored(school_id, classroom_id, school_name=nil, classroom_nam
   isClassroomIgnored
 end
 
-def is_child_ignored(school_id, classroom_ids, child_id, school_name=nil, classroom_names=nil, child_name)
+def is_child_ignored(school_id, classroom_ids, child_id, school_name=nil, classroom_names=nil, child_name=nil)
   is_child_school_ignored = is_school_ignored(school_id, school_name)
 
   are_all_child_classrooms_ignored = classroom_ids.all? do |classroom_id|
@@ -66,6 +67,16 @@ def is_child_ignored(school_id, classroom_ids, child_id, school_name=nil, classr
   end
 
   is_child_school_ignored || are_all_child_classrooms_ignored || is_child_explicitly_ignored
+end
+
+def is_child_included_in_graduated_override_config(school_id, child_id, school_name=nil, child_name=nil)
+  is_child_in_graduated_config = CONFIG['graduatedChildren'].any? do |graduated|
+    if graduated['schoolId'] == school_id or graduated['schoolName'] == school_name
+      graduated['children'].any? do |ignoreChildren|
+        ignoreChildren['id'] == child_id || ignoreChildren['name'] == child_name
+      end
+    end
+  end
 end
 
 def load_schools(tc)
@@ -108,6 +119,13 @@ def load_children(tc, school, session)
         school_name=school['name'],
         classroom_names=nil,
         child_name=name(child))
+
+    child['graduated'] = is_child_included_in_graduated_override_config(
+        school_id=school['id'],
+        child_id=child['id'],
+        school_name=school['name'],
+        child_name=name(child)
+    )
   end
 
   children
@@ -710,6 +728,11 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       if ignored
         notes.concat(reasons_child_ignored_details(child))
       end
+
+      graduated_override = child['graduated']
+      if graduated_override
+        notes << "Child marked graduated manually"
+      end
       is_child_kindergarten_eligible = is_child_kindergarten_eligible?(child, Date.parse(previous_year['start_date']), Date.parse(current_year['start_date']))
       in_infant_toddler_classroom = is_child_in_infant_toddler_classroom?(child)
 
@@ -724,12 +747,11 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         notes << "Matched with current year child - id: #{current_year_child_match_id} name: #{name(current_year_child_match)}"
       end
 
-      #is_continued_at_current_school = current_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(c['ignore'])}
       is_continued_at_current_school = is_currently_enrolled_in_network && child['school']['id'] == current_year_child_match['school']['id']
       is_continued_at_different_school = is_currently_enrolled_in_network && not(is_continued_at_current_school)
 
-      graduated_school = !age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
-      dropped_school = age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
+      graduated_school = graduated_override || (!age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school)
+      dropped_school = !graduated_school && age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
 
       csv << [
         child['id'],
