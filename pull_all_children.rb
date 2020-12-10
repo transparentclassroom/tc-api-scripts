@@ -145,7 +145,7 @@ tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Acorn Montessori'}
+#schools.reject! {|s| s['name'] == 'Ginkgo Montessori'}
 stats = {}
 
 puts '=' * 100
