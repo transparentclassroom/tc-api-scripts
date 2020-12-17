@@ -51,7 +51,10 @@ def is_classroom_ignored(school_id, classroom_id, school_name=nil, classroom_nam
   isClassroomIgnored
 end
 
-def is_child_ignored(school, classroom_ids, child)
+def is_child_ignored(child)
+  classroom_ids=child['classroom_ids']
+  school = child['school']
+
   is_child_school_ignored = is_school_ignored(school['id'], school['name'])
 
   are_all_child_classrooms_ignored = classroom_ids.all? do |classroom_id|
@@ -115,10 +118,7 @@ def load_children(tc, school, session)
   children.each do |child|
     child['school'] = school
 
-    child['ignore'] = is_child_ignored(
-        school=school,
-        classroom_ids=child['classroom_ids'],
-        child=child)
+    child['ignore'] = is_child_ignored(child=child)
 
     child['graduated_teacher'] = child.has_key?('exit_reason') && child['exit_reason'].downcase() == "graduated"
     child['graduated_parent'] = nil
@@ -414,10 +414,7 @@ def load_missing_children_from_csv(schools)
   children.reject!{|child| child['school'].nil?}
 
   children.each do |child|
-    child['ignore'] = is_child_ignored(
-        school=child['school'],
-        classroom_ids=child['classroom_ids'],
-        child=child)
+    child['ignore'] = is_child_ignored(child=child)
   end
 
   children
