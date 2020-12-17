@@ -32,6 +32,15 @@ ignoreChildren:
       - id:
         name:
 
+# graduatedChildren can be used to override the "graduated" logic and force marking a child graduated
+# note: schoolId or schoolName is required because children ids are not guaranteed to be unique across TC
+graduatedChildren:
+  - schoolId:
+    schoolName:
+    children:
+      - id:
+        name:
+
 # groupSchools can be used to define/report aggregate stats on a collection of schools
 # groups can be defined using the schools array attribute, or the groupIds array attribute
 # the groupIds attribute can be used to reference other groups/subgroups, for e.g.

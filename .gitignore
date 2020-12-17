@@ -3,3 +3,4 @@ output
 .ruby-gemset
 .ruby-version
 config.yml
+!/missing_children.template.csv

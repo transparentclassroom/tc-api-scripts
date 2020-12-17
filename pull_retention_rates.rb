@@ -5,8 +5,8 @@ require 'yaml'
 require_relative './lib/transparent_classroom/client'
 require_relative './lib/name_matcher/matcher'
 
-PREVIOUS_YEAR = '2018-19'
-CURRENT_YEAR = '2019-20'
+PREVIOUS_YEAR = '2019-20'
+CURRENT_YEAR = '2020-21'
 
 # Dates assume latest possible start and earliest possible finish
 # Min session length is meant to filter out unexpectedly short sessions, i.e. a winter or JTerm session
@@ -22,6 +22,7 @@ rescue
     'ignoreSchools' => [],
     'ignoreClassrooms' => [],
     'ignoreChildren' => [],
+    'graduatedChildren' => [],
     'groupSchools' => [],
   }
 end
@@ -50,22 +51,37 @@ def is_classroom_ignored(school_id, classroom_id, school_name=nil, classroom_nam
   isClassroomIgnored
 end
 
-def is_child_ignored(school_id, classroom_ids, child_id, school_name=nil, classroom_names=nil, child_name)
-  is_child_school_ignored = is_school_ignored(school_id, school_name)
+def is_child_ignored(child)
+  classroom_ids=child['classroom_ids']
+  school = child['school']
+
+  is_child_school_ignored = is_school_ignored(school['id'], school['name'])
 
   are_all_child_classrooms_ignored = classroom_ids.all? do |classroom_id|
-    is_classroom_ignored(school_id, classroom_id, school_name)
+    is_classroom_ignored(school['id'], classroom_id, school['name'])
   end
 
   is_child_explicitly_ignored = CONFIG['ignoreChildren'].any? do |ignore|
-    if ignore['schoolId'] == school_id or ignore['schoolName'] == school_name
+    if ignore['schoolId'] == school['id'] or ignore['schoolName'] == school['name']
       ignore['children'].any? do |ignoreChildren|
-        ignoreChildren['id'] == child_id || ignoreChildren['name'] == child_name
+        ignoreChildren['id'] == child['id'] || ignoreChildren['name'] == name(child)
       end
     end
   end
 
-  is_child_school_ignored || are_all_child_classrooms_ignored || is_child_explicitly_ignored
+  is_child_age_ignored = age_on(child, Date.parse(school['current_year']['start_date'])) >= to_age(years: 21, months: 0)
+
+  is_child_school_ignored || are_all_child_classrooms_ignored || is_child_explicitly_ignored || is_child_age_ignored
+end
+
+def is_child_included_in_graduated_override_config(school_id, child_id, school_name=nil, child_name=nil)
+  is_child_in_graduated_config = CONFIG['graduatedChildren'].any? do |graduated|
+    if graduated['schoolId'] == school_id or graduated['schoolName'] == school_name
+      graduated['children'].any? do |ignoreChildren|
+        ignoreChildren['id'] == child_id || ignoreChildren['name'] == child_name
+      end
+    end
+  end
 end
 
 def load_schools(tc)
@@ -98,16 +114,35 @@ def load_children(tc, school, session)
   tc.school_id = school['id']
 
   children = tc.get 'children.json', params: { session_id: session['id'] }
-  children.each { |child| child['school'] = school['name'] }
 
   children.each do |child|
-    child['ignore'] = is_child_ignored(
+    child['school'] = school
+
+    child['ignore'] = is_child_ignored(child=child)
+
+    child['graduated_teacher'] = child.has_key?('exit_reason') && child['exit_reason'].downcase() == "graduated"
+    child['graduated_parent'] = nil
+    child['exit_survey'] = nil
+    child['parent_exit_reason'] = nil
+    if child.has_key?('exit_survey_id') && child['exit_survey_id'] != nil
+      exit_survey_response = tc.get("forms/#{child['exit_survey_id']}.json")
+
+      child['exit_survey'] = exit_survey_response
+      child['parent_exit_reason'] = nil
+      if exit_survey_response['state'] == "submitted" && exit_survey_response.has_key?('fields') && exit_survey_response['fields'].has_key?('Reason for Leaving')
+        child['parent_exit_reason'] = exit_survey_response['fields']["Reason for Leaving"]
+        child['graduated_parent'] = exit_survey_response['fields']["Reason for Leaving"].downcase() == "graduated"
+      end
+    end
+
+    child['graduated_override'] = is_child_included_in_graduated_override_config(
         school_id=school['id'],
-        classroom_ids=child['classroom_ids'],
         child_id=child['id'],
         school_name=school['name'],
-        classroom_names=nil,
-        child_name=name(child))
+        child_name=name(child)
+    )
+
+    child['fingerprint'] = fingerprint(child)
   end
 
   children
@@ -288,10 +323,6 @@ def is_child_in_infant_toddler_classroom?(child)
   infant_toddler_classroom?(classroom)
 end
 
-# def is_child_ignored(child)
-#   child_ignored_list(child).values.reduce(false) { |agg, reason| agg || reason }
-# end
-
 def reasons_child_ignored_details(child)
   details = []
 
@@ -312,17 +343,93 @@ def reasons_child_ignored_details(child)
   details
 end
 
+
+def does_children_collection_include(children, child)
+  # if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
+  if children.has_key?(child['fingerprint']) && not(children[child['fingerprint']]['ignore'])
+    return [true, children[child['fingerprint']]]
+  end
+
+  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(c['ignore']) }
+  if children_with_birthdate.empty?
+    return [false, nil]
+  end
+
+  puts "Performing fuzzy match on #{name(child)}"
+  nearest = children_with_birthdate.map{ |c| {c => NamesMatcher.distance(name(child), name(c))}}.min_by{|r| r.values}
+  match = nearest.values.first <= 0.8
+  if match
+    puts "Found #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
+    return [true, nearest.keys.first]
+  else
+    puts "No match, nearest candidate #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
+    return [false, nil]
+  end
+end
+
+def get_school_from_name(school_name, schools)
+  match = schools.detect do |school|
+    break school if school['name'].strip.downcase == school_name.strip.downcase
+  end
+
+  match
+end
+
+def get_classroom_from_name(classroom_name, schools)
+  classroom = schools.detect do |school|
+    c = school['classrooms_by_id'].detect do |_, classroom|
+      break classroom if classroom['name'].strip.downcase == classroom_name.strip.downcase
+    end
+
+    break c if c
+  end
+
+  classroom
+end
+
+def load_missing_children_from_csv(schools)
+  return [] unless File.file?("missing_children.csv")
+
+  missing = CSV.parse(File.read("missing_children.csv"), headers: true)
+
+  children = missing.map do |raw|
+    child = {
+        'id' => raw['child_id'].to_i,
+        'school' => get_school_from_name(raw['school_name'], schools),
+        'first_name' => raw['first_name'],
+        'last_name' => raw['last_name'],
+        'birth_date' => raw['birth_date'],
+        'ethnicity' => (raw['ethnicity'] || '').split(","),
+        'household_income' => raw['household_income'],
+        'dominant_language' => raw['dominant_language'],
+        'classroom_ids' => raw['classroom_names'].split(",").map{|name| c = get_classroom_from_name(name, schools); c ? c['id'].to_i : nil }.compact,
+        'was_missing' => true
+    }
+    child['fingerprint'] = fingerprint(child)
+
+    child
+  end
+
+  # Scrub records that could not be associated with a school
+  children.reject!{|child| child['school'].nil?}
+
+  children.each do |child|
+    child['ignore'] = is_child_ignored(child=child)
+  end
+
+  children
+end
+
 dir = File.expand_path("output", File.dirname(__FILE__))
 FileUtils.mkdir_p(dir) unless File.directory?(dir)
 
-# tc = TransparentClassroom::Client.new base_url: 'http://localhost:3000/api/v1'
 tc = TransparentClassroom::Client.new
 tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Acorn Montessori'}
+#schools.reject! {|s| s['name'] != 'Sweet Pea Montessori'}
 stats = {}
 
 puts '=' * 100
@@ -369,12 +476,7 @@ schools.each do |school|
 
   load_children_for_sessions = lambda do |sessions|
     children = sessions.map do |session|
-      load_children(tc, school, session).map do |child|
-        child['school'] = school
-        child['fingerprint'] = fingerprint(child)
-
-        child
-      end
+      load_children(tc, school, session)
     end.flatten
 
     children.uniq { |c| c['id'] }
@@ -411,10 +513,34 @@ schools.each do |school|
 end
 
 puts
+puts "Adding Missing Children to #{PREVIOUS_YEAR}".bold
+puts '=' * 100
+missing_children = load_missing_children_from_csv(schools)
+
+puts
 puts "Organizing Collection of All Children for #{PREVIOUS_YEAR}".bold
 puts '=' * 100
 previous_years_children = {}
 schools.each do |school|
+  fids = school['previous_year']['children'].map do |child|
+    child['fingerprint']
+  end
+
+  child_ids = school['previous_year']['children'].map do |child|
+    child['id']
+  end
+
+  missing_children_for_school = missing_children.find_all do |missing|
+    school['id'] == missing['school']['id']
+  end
+
+  missing_children_for_school.each do |missing|
+    unless fids.include?(missing['fingerprint']) || child_ids.include?(missing['id'])
+      puts "Adding child from missing_children.csv: #{name(missing)} (#{missing['id']}) - #{missing['school']['name']} - #{missing['classroom_ids']}".yellow
+      school['previous_year']['children'] << missing
+    end
+  end
+
   school['previous_year']['children'].each do |child|
     fid = child['fingerprint']
     if previous_years_children.has_key?(fid)
@@ -422,29 +548,6 @@ schools.each do |school|
     else
       previous_years_children[fid] = child
     end
-  end
-end
-
-def does_children_collection_include(children, child)
-  # if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
-  if children.has_key?(child['fingerprint']) && not(children[child['fingerprint']]['ignore'])
-    return [true, children[child['fingerprint']]]
-  end
-
-  children_with_birthdate = children.values.select { |c| child['birth_date'] == c['birth_date'] && not(c['ignore']) }
-  if children_with_birthdate.empty?
-    return [false, nil]
-  end
-
-  puts "Performing fuzzy match on #{name(child)}"
-  nearest = children_with_birthdate.map{ |c| {c => NamesMatcher.distance(name(child), name(c))}}.min_by{|r| r.values}
-  match = nearest.values.first <= 0.8
-  if match
-    puts "Found #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
-    return [true, nearest.keys.first]
-  else
-    puts "No match, nearest candidate #{name(nearest.keys.first)} w/ distance #{nearest.values.first}"
-    return [false, nil]
   end
 end
 
@@ -490,7 +593,6 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
   ]
   schools.each do |school|
     current_year = school['current_year']
-    previous_year = school['previous_year']
 
     next if current_year['children'].empty?
 
@@ -542,8 +644,8 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
           was_previously_enrolled_in_network,
           was_previously_at_different_school,
           previous_year_child_match_id,
-          too_old?(classroom, age_on(child, stop_date)) ? 'Y' : 'N',
-          ignored ? 'Y' : 'N',
+          too_old?(classroom, age_on(child, stop_date)),
+          ignored,
           notes.join("\n"),
       ]
     end
@@ -577,7 +679,12 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     "Continued Network",
     "Dropped School",
     'Kindergarten Eligible Year',
+    'Exit Reason (teacher)',
+    'Graduated According to Teacher',
+    'Exit Reason (parent)',
+    'Graduated According to Parent',
     'Ignored',
+    'Added Manually (previously deleted from TC)',
     'Notes',
   ]
 
@@ -612,6 +719,36 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       dropped_school_but_continued_in_network_kindergarten_or_infant_toddler: [],
       enrolled_current_year: current_year['children'].reject{ |c| c['ignore'] },
       enrolled_previous_year: previous_year['children'].reject{ |c| c['ignore'] },
+      exit_reason_teacher_graduated: [],
+      exit_reason_teacher_relocated: [],
+      exit_reason_teacher_expense: [],
+      exit_reason_teacher_hours_offered: [],
+      exit_reason_teacher_location: [],
+      exit_reason_teacher_eligible_for_kindergarten: [],
+      exit_reason_teacher_asked_to_leave: [],
+      exit_reason_teacher_joined_sibling: [],
+      exit_reason_teacher_no_lottery_spot: [],
+      exit_reason_teacher_bad_fit: [],
+      exit_reason_teacher_equity: [],
+      exit_reason_teacher_family_dissatisfied: [],
+      exit_reason_teacher_natural_disaster: [],
+      exit_reason_teacher_entered_public_system: [],
+      exit_reason_teacher_transferred_multi_year: [],
+      exit_reason_parent_graduated: [],
+      exit_reason_parent_relocated: [],
+      exit_reason_parent_expense: [],
+      exit_reason_parent_hours_offered: [],
+      exit_reason_parent_location: [],
+      exit_reason_parent_eligible_for_kindergarten: [],
+      exit_reason_parent_asked_to_leave: [],
+      exit_reason_parent_joined_sibling: [],
+      exit_reason_parent_no_lottery_spot: [],
+      exit_reason_parent_bad_fit: [],
+      exit_reason_parent_equity: [],
+      exit_reason_parent_family_dissatisfied: [],
+      exit_reason_parent_natural_disaster: [],
+      exit_reason_parent_entered_public_system: [],
+      exit_reason_parent_transferred_multi_year: []
     }
 
     next if previous_year['children'].empty?
@@ -627,6 +764,11 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       if ignored
         notes.concat(reasons_child_ignored_details(child))
       end
+
+      graduated_override = child['graduated_override']
+      if graduated_override
+        notes << "Child marked graduated manually"
+      end
       is_child_kindergarten_eligible = is_child_kindergarten_eligible?(child, Date.parse(previous_year['start_date']), Date.parse(current_year['start_date']))
       in_infant_toddler_classroom = is_child_in_infant_toddler_classroom?(child)
 
@@ -641,12 +783,11 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         notes << "Matched with current year child - id: #{current_year_child_match_id} name: #{name(current_year_child_match)}"
       end
 
-      #is_continued_at_current_school = current_year['children'].any? {|c| c['fingerprint'] == child['fingerprint'] && not(c['ignore'])}
       is_continued_at_current_school = is_currently_enrolled_in_network && child['school']['id'] == current_year_child_match['school']['id']
       is_continued_at_different_school = is_currently_enrolled_in_network && not(is_continued_at_current_school)
 
-      graduated_school = !age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
-      dropped_school = age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
+      graduated_school = graduated_override || child['graduated_teacher'] || (!age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school)
+      dropped_school = !graduated_school && age_appropriate_for_school?(school, age_on(child, start_date)) && !is_continued_at_current_school
 
       csv << [
         child['id'],
@@ -667,14 +808,19 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         is_currently_enrolled_in_network,
         is_continued_at_different_school,
         current_year_child_match_id,
-        too_old?(classroom, age_on(child, start_date)) ? 'Y' : 'N',
+        too_old?(classroom, age_on(child, start_date)),
         age_appropriate_for_school?(school, age_on(child, start_date)),
         graduated_school,
         is_continued_at_current_school,
         is_currently_enrolled_in_network,
         dropped_school,
         is_child_kindergarten_eligible,
-        ignored ? 'Y' : 'N',
+        child['exit_reason'],
+        child['graduated_teacher'],
+        child['parent_exit_reason'],
+        child['graduated_parent'],
+        ignored,
+        child['was_missing'] || false,
         notes.join("\n"),
       ]
 
@@ -758,6 +904,76 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
           end
         end
       end
+
+      if child.has_key?('exit_reason') && child['exit_reason'] != nil
+        case child['exit_reason'].downcase()
+        when 'graduated'
+          school_stats[:exit_reason_teacher_graduated] << child
+        when 'relocated'
+          school_stats[:exit_reason_teacher_relocated] << child
+        when 'expense'
+          school_stats[:exit_reason_teacher_expense] << child
+        when 'hours_offered'
+          school_stats[:exit_reason_teacher_hours_offered] << child
+        when 'location'
+          school_stats[:exit_reason_teacher_location] << child
+        when 'eligible_for_kindergarten'
+          school_stats[:exit_reason_teacher_eligible_for_kindergarten] << child
+        when 'asked_to_leave'
+          school_stats[:exit_reason_teacher_asked_to_leave] << child
+        when 'joined_sibling'
+          school_stats[:exit_reason_teacher_joined_sibling] << child
+        when 'no_lottery_spot'
+          school_stats[:exit_reason_teacher_no_lottery_spot] << child
+        when 'bad_fit'
+          school_stats[:exit_reason_teacher_bad_fit] << child
+        when 'equity'
+          school_stats[:exit_reason_teacher_equity] << child
+        when 'family_dissatisfied'
+          school_stats[:exit_reason_teacher_family_dissatisfied] << child
+        when 'natural_disaster'
+          school_stats[:exit_reason_teacher_natural_disaster] << child
+        when 'entered_public_system'
+          school_stats[:exit_reason_teacher_entered_public_system] << child
+        when 'transferred_multi_year'
+          school_stats[:exit_reason_teacher_transferred_multi_year] << child
+        end
+      end
+
+      if child.has_key?('parent_exit_reason') && child['parent_exit_reason'] != nil
+        case child['parent_exit_reason'].downcase()
+        when 'graduated'
+          school_stats[:exit_reason_parent_graduated] << child
+        when 'relocated'
+          school_stats[:exit_reason_parent_relocated] << child
+        when 'expense'
+          school_stats[:exit_reason_parent_expense] << child
+        when 'hours_offered'
+          school_stats[:exit_reason_parent_hours_offered] << child
+        when 'location'
+          school_stats[:exit_reason_parent_location] << child
+        when 'eligible_for_kindergarten'
+          school_stats[:exit_reason_parent_eligible_for_kindergarten] << child
+        when 'asked_to_leave'
+          school_stats[:exit_reason_parent_asked_to_leave] << child
+        when 'joined_sibling'
+          school_stats[:exit_reason_parent_joined_sibling] << child
+        when 'no_lottery_spot'
+          school_stats[:exit_reason_parent_no_lottery_spot] << child
+        when 'bad_fit'
+          school_stats[:exit_reason_parent_bad_fit] << child
+        when 'equity'
+          school_stats[:exit_reason_parent_equity] << child
+        when 'family_dissatisfied'
+          school_stats[:exit_reason_parent_family_dissatisfied] << child
+        when 'natural_disaster'
+          school_stats[:exit_reason_parent_natural_disaster] << child
+        when 'entered_public_system'
+          school_stats[:exit_reason_parent_entered_public_system] << child
+        when 'transferred_multi_year'
+          school_stats[:exit_reason_parent_transferred_multi_year] << child
+        end
+      end
     end
   end
 end
@@ -790,6 +1006,36 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     'Dropped School but Continued in Network (Infant/Toddler Classroom)',
     'Dropped School (Kindergarten & Infant/Toddler Classroom)',
     'Dropped School but Continued in Network (Kindergarten & Infant/Toddler Classroom)',
+    'Exit: Graduated (teacher)',
+    'Exit: Relocated (teacher)',
+    'Exit: Expense (teacher)',
+    'Exit: Hours offered (teacher)',
+    'Exit: Location (teacher)',
+    'Exit: Eligible for kindergarten (teacher)',
+    'Exit: Asked to leave (teacher)',
+    'Exit: Joined sibling (teacher)',
+    'Exit: No lottery spot (teacher)',
+    'Exit: Bad fit (teacher)',
+    'Exit: Equity (teacher)',
+    'Exit: Family dissatisfied (teacher)',
+    'Exit: Natural disaster (teacher)',
+    'Exit: Entered public system (teacher)',
+    'Exit: Transferred multi year (teacher)',
+    'Exit: Graduated (parent)',
+    'Exit: Relocated (parent)',
+    'Exit: Expense (parent)',
+    'Exit: Hours offered (parent)',
+    'Exit: Location (parent)',
+    'Exit: Eligible for kindergarten (parent)',
+    'Exit: Asked to leave (parent)',
+    'Exit: Joined sibling (parent)',
+    'Exit: No lottery spot (parent)',
+    'Exit: Bad fit (parent)',
+    'Exit: Equity (parent)',
+    'Exit: Family dissatisfied (parent)',
+    'Exit: Natural disaster (parent)',
+    'Exit: Entered public system (parent)',
+    'Exit: Transferred multi year (parent)',
     'Retention Rate',
     'Retention Rate (Ignoring Kindergarten Eligible)',
     'Retention Rate (Ignoring Infant/Toddler Classroom)',
@@ -809,7 +1055,61 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     dsk, dscnk = school_stats[:dropped_school_kindergarten].length, school_stats[:dropped_school_but_continued_in_network_kindergarten].length
     dsit, dscnit = school_stats[:dropped_school_infant_toddler].length, school_stats[:dropped_school_but_continued_in_network_infant_toddler].length
     dskit, dscnkit = school_stats[:dropped_school_kindergarten_or_infant_toddler].length, school_stats[:dropped_school_but_continued_in_network_kindergarten_or_infant_toddler].length
-    row = [school['name'], tp, tc, gs, gsc, c, cs, cn, csk, cnk, csit, cnit, cskit, cnkit, ds, dscn, dsk, dscnk, dsit, dscnit, dskit, dscnkit]
+    row = [
+      school['name'],
+      tp,
+      tc,
+      gs,
+      gsc,
+      c,
+      cs,
+      cn,
+      csk,
+      cnk,
+      csit,
+      cnit,
+      cskit,
+      cnkit,
+      ds,
+      dscn,
+      dsk,
+      dscnk,
+      dsit,
+      dscnit,
+      dskit,
+      dscnkit,
+      school_stats[:exit_reason_teacher_graduated].length,
+      school_stats[:exit_reason_teacher_relocated].length,
+      school_stats[:exit_reason_teacher_expense].length,
+      school_stats[:exit_reason_teacher_hours_offered].length,
+      school_stats[:exit_reason_teacher_location].length,
+      school_stats[:exit_reason_teacher_eligible_for_kindergarten].length,
+      school_stats[:exit_reason_teacher_asked_to_leave].length,
+      school_stats[:exit_reason_teacher_joined_sibling].length,
+      school_stats[:exit_reason_teacher_no_lottery_spot].length,
+      school_stats[:exit_reason_teacher_bad_fit].length,
+      school_stats[:exit_reason_teacher_equity].length,
+      school_stats[:exit_reason_teacher_family_dissatisfied].length,
+      school_stats[:exit_reason_teacher_natural_disaster].length,
+      school_stats[:exit_reason_teacher_entered_public_system].length,
+      school_stats[:exit_reason_teacher_transferred_multi_year].length,
+      school_stats[:exit_reason_parent_graduated].length,
+      school_stats[:exit_reason_parent_relocated].length,
+      school_stats[:exit_reason_parent_expense].length,
+      school_stats[:exit_reason_parent_hours_offered].length,
+      school_stats[:exit_reason_parent_location].length,
+      school_stats[:exit_reason_parent_eligible_for_kindergarten].length,
+      school_stats[:exit_reason_parent_asked_to_leave].length,
+      school_stats[:exit_reason_parent_joined_sibling].length,
+      school_stats[:exit_reason_parent_no_lottery_spot].length,
+      school_stats[:exit_reason_parent_bad_fit].length,
+      school_stats[:exit_reason_parent_equity].length,
+      school_stats[:exit_reason_parent_family_dissatisfied].length,
+      school_stats[:exit_reason_parent_natural_disaster].length,
+      school_stats[:exit_reason_parent_entered_public_system].length,
+      school_stats[:exit_reason_parent_transferred_multi_year].length
+    ]
+
     notes = []
 
     ignored = false
@@ -911,6 +1211,36 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     'Dropped School but Continued in Network (Infant/Toddler Classrooms)',
     'Dropped School (Kindergarten or Infant/Toddler Classroom)',
     'Dropped School but Continued in Network (Kindergarten or Infant/Toddler Classrooms)',
+    'Exit: Graduated (teacher)',
+    'Exit: Relocated (teacher)',
+    'Exit: Expense (teacher)',
+    'Exit: Hours offered (teacher)',
+    'Exit: Location (teacher)',
+    'Exit: Eligible for kindergarten (teacher)',
+    'Exit: Asked to leave (teacher)',
+    'Exit: Joined sibling (teacher)',
+    'Exit: No lottery spot (teacher)',
+    'Exit: Bad fit (teacher)',
+    'Exit: Equity (teacher)',
+    'Exit: Family dissatisfied (teacher)',
+    'Exit: Natural disaster (teacher)',
+    'Exit: Entered public system (teacher)',
+    'Exit: Transferred multi year (teacher)',
+    'Exit: Graduated (parent)',
+    'Exit: Relocated (parent)',
+    'Exit: Expense (parent)',
+    'Exit: Hours offered (parent)',
+    'Exit: Location (parent)',
+    'Exit: Eligible for kindergarten (parent)',
+    'Exit: Asked to leave (parent)',
+    'Exit: Joined sibling (parent)',
+    'Exit: No lottery spot (parent)',
+    'Exit: Bad fit (parent)',
+    'Exit: Equity (parent)',
+    'Exit: Family dissatisfied (parent)',
+    'Exit: Natural disaster (parent)',
+    'Exit: Entered public system (parent)',
+    'Exit: Transferred multi year (parent)',
     'Retention Rate (schools)',
     'Retention Rate (schools: Ignoring Kindergarten Eligible)',
     'Retention Rate (schools: Ignoring Toddler/Infant Classrooms)',
@@ -961,7 +1291,7 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       school
     end.compact
 
-    group_stats = {tp:0, tc: 0, gs: 0, gsc: 0, c: 0, cs: 0, cn: 0, csk: 0, cnk: 0, csit: 0, cnit: 0, cskit: 0, cnkit: 0, ds:0, dscn: 0, dsk: 0, dscnk: 0, dsit: 0, dscnit: 0, dskit: 0, dscnkit: 0}
+    group_stats = {tp:0, tc: 0, gs: 0, gsc: 0, c: 0, cs: 0, cn: 0, csk: 0, cnk: 0, csit: 0, cnit: 0, cskit: 0, cnkit: 0, ds:0, dscn: 0, dsk: 0, dscnk: 0, dsit: 0, dscnit: 0, dskit: 0, dscnkit: 0, exit_reason_teacher_graduated: 0, exit_reason_teacher_relocated: 0, exit_reason_teacher_expense: 0, exit_reason_teacher_hours_offered: 0, exit_reason_teacher_location: 0, exit_reason_teacher_eligible_for_kindergarten: 0, exit_reason_teacher_asked_to_leave: 0, exit_reason_teacher_joined_sibling: 0, exit_reason_teacher_no_lottery_spot: 0, exit_reason_teacher_bad_fit: 0, exit_reason_teacher_equity: 0, exit_reason_teacher_family_dissatisfied: 0, exit_reason_teacher_natural_disaster: 0, exit_reason_teacher_entered_public_system: 0, exit_reason_teacher_transferred_multi_year: 0, exit_reason_parent_graduated: 0, exit_reason_parent_relocated: 0, exit_reason_parent_expense: 0, exit_reason_parent_hours_offered: 0, exit_reason_parent_location: 0, exit_reason_parent_eligible_for_kindergarten: 0, exit_reason_parent_asked_to_leave: 0, exit_reason_parent_joined_sibling: 0, exit_reason_parent_no_lottery_spot: 0, exit_reason_parent_bad_fit: 0, exit_reason_parent_equity: 0, exit_reason_parent_family_dissatisfied: 0, exit_reason_parent_natural_disaster: 0, exit_reason_parent_entered_public_system: 0, exit_reason_parent_transferred_multi_year: 0}
     group_schools.each do |school|
       school_stats = stats[school['id']]
 
@@ -999,9 +1329,39 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       group_stats[:dscnit] += school_stats[:dropped_school_but_continued_in_network_infant_toddler].length
       group_stats[:dskit] += school_stats[:dropped_school_kindergarten_or_infant_toddler].length
       group_stats[:dscnkit] += school_stats[:dropped_school_but_continued_in_network_kindergarten_or_infant_toddler].length
+      group_stats[:exit_reason_teacher_graduated] += school_stats[:exit_reason_teacher_graduated].length
+      group_stats[:exit_reason_teacher_relocated] += school_stats[:exit_reason_teacher_relocated].length
+      group_stats[:exit_reason_teacher_expense] += school_stats[:exit_reason_teacher_expense].length
+      group_stats[:exit_reason_teacher_hours_offered] += school_stats[:exit_reason_teacher_hours_offered].length
+      group_stats[:exit_reason_teacher_location] += school_stats[:exit_reason_teacher_location].length
+      group_stats[:exit_reason_teacher_eligible_for_kindergarten] += school_stats[:exit_reason_teacher_eligible_for_kindergarten].length
+      group_stats[:exit_reason_teacher_asked_to_leave] += school_stats[:exit_reason_teacher_asked_to_leave].length
+      group_stats[:exit_reason_teacher_joined_sibling] += school_stats[:exit_reason_teacher_joined_sibling].length
+      group_stats[:exit_reason_teacher_no_lottery_spot] += school_stats[:exit_reason_teacher_no_lottery_spot].length
+      group_stats[:exit_reason_teacher_bad_fit] += school_stats[:exit_reason_teacher_bad_fit].length
+      group_stats[:exit_reason_teacher_equity] += school_stats[:exit_reason_teacher_equity].length
+      group_stats[:exit_reason_teacher_family_dissatisfied] += school_stats[:exit_reason_teacher_family_dissatisfied].length
+      group_stats[:exit_reason_teacher_natural_disaster] += school_stats[:exit_reason_teacher_natural_disaster].length
+      group_stats[:exit_reason_teacher_entered_public_system] += school_stats[:exit_reason_teacher_entered_public_system].length
+      group_stats[:exit_reason_teacher_transferred_multi_year] += school_stats[:exit_reason_teacher_transferred_multi_year].length
+      group_stats[:exit_reason_parent_graduated] += school_stats[:exit_reason_parent_graduated].length
+      group_stats[:exit_reason_parent_relocated] += school_stats[:exit_reason_parent_relocated].length
+      group_stats[:exit_reason_parent_expense] += school_stats[:exit_reason_parent_expense].length
+      group_stats[:exit_reason_parent_hours_offered] += school_stats[:exit_reason_parent_hours_offered].length
+      group_stats[:exit_reason_parent_location] += school_stats[:exit_reason_parent_location].length
+      group_stats[:exit_reason_parent_eligible_for_kindergarten] += school_stats[:exit_reason_parent_eligible_for_kindergarten].length
+      group_stats[:exit_reason_parent_asked_to_leave] += school_stats[:exit_reason_parent_asked_to_leave].length
+      group_stats[:exit_reason_parent_joined_sibling] += school_stats[:exit_reason_parent_joined_sibling].length
+      group_stats[:exit_reason_parent_no_lottery_spot] += school_stats[:exit_reason_parent_no_lottery_spot].length
+      group_stats[:exit_reason_parent_bad_fit] += school_stats[:exit_reason_parent_bad_fit].length
+      group_stats[:exit_reason_parent_equity] += school_stats[:exit_reason_parent_equity].length
+      group_stats[:exit_reason_parent_family_dissatisfied] += school_stats[:exit_reason_parent_family_dissatisfied].length
+      group_stats[:exit_reason_parent_natural_disaster] += school_stats[:exit_reason_parent_natural_disaster].length
+      group_stats[:exit_reason_parent_entered_public_system] += school_stats[:exit_reason_parent_entered_public_system].length
+      group_stats[:exit_reason_parent_transferred_multi_year] += school_stats[:exit_reason_parent_transferred_multi_year].length
     end
 
-    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:gs], group_stats[:gsc], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:csk], group_stats[:cnk], group_stats[:csit], group_stats[:cnit], group_stats[:cskit], group_stats[:cnkit], group_stats[:ds], group_stats[:dscn], group_stats[:dsk], group_stats[:dscnk], group_stats[:dsit], group_stats[:dscnit], group_stats[:dskit], group_stats[:dscnkit]]
+    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:gs], group_stats[:gsc], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:csk], group_stats[:cnk], group_stats[:csit], group_stats[:cnit], group_stats[:cskit], group_stats[:cnkit], group_stats[:ds], group_stats[:dscn], group_stats[:dsk], group_stats[:dscnk], group_stats[:dsit], group_stats[:dscnit], group_stats[:dskit], group_stats[:dscnkit], group_stats[:exit_reason_teacher_graduated], group_stats[:exit_reason_teacher_relocated], group_stats[:exit_reason_teacher_expense], group_stats[:exit_reason_teacher_hours_offered], group_stats[:exit_reason_teacher_location], group_stats[:exit_reason_teacher_eligible_for_kindergarten], group_stats[:exit_reason_teacher_asked_to_leave], group_stats[:exit_reason_teacher_joined_sibling], group_stats[:exit_reason_teacher_no_lottery_spot], group_stats[:exit_reason_teacher_bad_fit], group_stats[:exit_reason_teacher_equity], group_stats[:exit_reason_teacher_family_dissatisfied], group_stats[:exit_reason_teacher_natural_disaster], group_stats[:exit_reason_teacher_entered_public_system], group_stats[:exit_reason_teacher_transferred_multi_year], group_stats[:exit_reason_parent_graduated], group_stats[:exit_reason_parent_relocated], group_stats[:exit_reason_parent_expense], group_stats[:exit_reason_parent_hours_offered], group_stats[:exit_reason_parent_location], group_stats[:exit_reason_parent_eligible_for_kindergarten], group_stats[:exit_reason_parent_asked_to_leave], group_stats[:exit_reason_parent_joined_sibling], group_stats[:exit_reason_parent_no_lottery_spot], group_stats[:exit_reason_parent_bad_fit], group_stats[:exit_reason_parent_equity], group_stats[:exit_reason_parent_family_dissatisfied], group_stats[:exit_reason_parent_natural_disaster], group_stats[:exit_reason_parent_entered_public_system], group_stats[:exit_reason_parent_transferred_multi_year]]
 
     # School retention
     if (group_stats[:cs] + group_stats[:ds]) > 0 # computing avg. school retention rate (not considering retention within network)

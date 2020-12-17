@@ -1,6 +1,7 @@
 require 'base64'
 require 'colorize'
 require 'csv'
+require 'json'
 require 'yaml'
 require_relative './lib/transparent_classroom/client'
 require_relative './lib/name_matcher/matcher'
@@ -144,7 +145,7 @@ tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 schools = load_schools(tc)
 
 #schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Acorn Montessori'}
+#schools.reject! {|s| s['name'] == 'Ginkgo Montessori'}
 stats = {}
 
 puts '=' * 100
@@ -226,23 +227,28 @@ end
 
 CSV.open("#{dir}/all_children_#{SCHOOL_YEAR}.csv", 'wb') do |csv|
   csv << [
-    'ID',
-    'School',
-    'First',
-    'Last',
-    'Birthdate',
-    'Ethnicity',
-    'Household Income',
-    'Dominant Language',
-    "Classrooms",
-    "Classrooms levels",
-    "In Infant/Toddler Classroom",
-    "Start of #{SCHOOL_YEAR}",
-    "End of #{SCHOOL_YEAR}",
-    "Age at Start of #{SCHOOL_YEAR}",
-    "Age in Months at Start of #{SCHOOL_YEAR}",
-    "Classrooms aging out Midyear",
-    'Notes',
+    'child_id',
+    'child_raw',
+    'school_id',
+    'school_name',
+    'school_raw',
+    'child_first_name',
+    'child_last_name',
+    'child_birthdate',
+    'child_ethnicity',
+    'child_household_income',
+    'child_dominant_language',
+    "classrooms_raw",
+    "classroom_ids",
+    "classroom_names",
+    "classroom_levels",
+    "classrooms_aging_out_midyear",
+    "in_infant_toddler_classroom",
+    "start_of_#{SCHOOL_YEAR}",
+    "end_of_#{SCHOOL_YEAR}",
+    "age_at_start_of_#{SCHOOL_YEAR}",
+    "age_in_months_at_start_of_#{SCHOOL_YEAR}",
+    'notes',
   ]
   schools.each do |school|
     current_year = school['current_year']
@@ -261,21 +267,26 @@ CSV.open("#{dir}/all_children_#{SCHOOL_YEAR}.csv", 'wb') do |csv|
 
       csv << [
           child['id'],
+          child.to_json(:except => 'school'),
+          school['id'],
           school['name'],
+          school.to_json(:except => 'current_year'),
           child['first_name'],
           child['last_name'],
           child['birth_date'],
           child['ethnicity']&.join(", "),
           child['household_income'],
           child['dominant_language'],
+          classrooms.to_json,
+          classrooms ? classrooms.map {|c| c['id'] }.join(',') : nil,
           classrooms ? classrooms.map {|c| c['name'] }.join(',') : nil,
           classrooms ? classrooms.map {|c| c['level'] }.join(',') : nil,
+          classrooms ? classrooms.map {|c| too_old?(c, age_on(child, stop_date))}.join(','): nil,
           is_child_in_infant_toddler_classroom?(child),
           start_date,
           stop_date,
           format_age(age_on(child, start_date)),
           age_on(child, start_date),
-          classrooms ? classrooms.map {|c| too_old?(c, age_on(child, stop_date)) ? 'Y' : 'N'}.join(','): nil,
           notes.join("\n"),
       ]
     end
