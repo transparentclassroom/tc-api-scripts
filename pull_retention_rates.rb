@@ -1,7 +1,9 @@
 require 'base64'
 require 'colorize'
 require 'csv'
+require 'date'
 require 'yaml'
+require_relative 'lib/data_mapper/mapper'
 require_relative './lib/transparent_classroom/client'
 require_relative './lib/name_matcher/matcher'
 
@@ -120,10 +122,12 @@ def load_children(tc, school, session)
 
     child['ignore'] = is_child_ignored(child=child)
 
-    child['graduated_teacher'] = child.has_key?('exit_reason') && child['exit_reason'].downcase() == "graduated"
+    child['graduated_teacher'] = child.has_key?('exit_reason') && child['exit_reason'].downcase == "graduated"
     child['graduated_parent'] = nil
     child['exit_survey'] = nil
     child['parent_exit_reason'] = nil
+    child['ethnicity_original'] = child['ethnicity'].clone
+    child['ethnicity_survey_original'] = nil
     if child.has_key?('exit_survey_id') && child['exit_survey_id'] != nil
       exit_survey_response = tc.get("forms/#{child['exit_survey_id']}.json")
 
@@ -131,7 +135,7 @@ def load_children(tc, school, session)
       child['parent_exit_reason'] = nil
       if exit_survey_response['state'] == "submitted" && exit_survey_response.has_key?('fields') && exit_survey_response['fields'].has_key?('Reason for Leaving')
         child['parent_exit_reason'] = exit_survey_response['fields']["Reason for Leaving"]
-        child['graduated_parent'] = exit_survey_response['fields']["Reason for Leaving"].downcase() == "graduated"
+        child['graduated_parent'] = exit_survey_response['fields']["Reason for Leaving"].downcase == "graduated"
       end
     end
 
@@ -146,6 +150,94 @@ def load_children(tc, school, session)
   end
 
   children
+end
+
+def load_network_family_survey_form_templates(tc)
+  tc.school_id = nil
+
+  forms = tc.get("form_templates.json")
+  network_forms = forms.map do |f|
+    network_template_id = f['id']
+    network_template_name = f['name']
+
+    if network_template_name =~ /family survey/i
+      {
+        network_template_id: network_template_id,
+        network_template_name: network_template_name,
+        is_family_survey: true
+      }
+    else
+      nil
+    end
+  end
+
+  network_forms.compact
+end
+
+def load_school_family_survey_form_templates(tc, network_family_survey_forms, school)
+  tc.school_id = school['id']
+
+  network_family_survey_ids = network_family_survey_forms.map{|f| f[:network_template_id]}
+  forms = tc.get("form_templates.json")
+  school_forms = forms.map do |f|
+    school_template_id = f['id']
+    school_template_name = f['name']
+
+    is_family_survey_school_template = false
+    f['widgets'].each do |w|
+      if w['type'] == 'EmbeddedForm' && network_family_survey_ids.include?(w['embedded_form_id'].to_i)
+        is_family_survey_school_template = true
+        break
+      end
+    end
+
+    if is_family_survey_school_template
+      {
+        school_template_id: school_template_id,
+        school_template_name: school_template_name,
+        is_family_survey: is_family_survey_school_template
+      }
+    else
+      nil
+    end
+  end
+
+  school_forms.compact
+end
+
+def load_school_family_survey_form_data(tc, school_family_survey_form_templates, school)
+  tc.school_id = school['id']
+
+  school_family_survey_ids = school_family_survey_form_templates.map{|f| f[:school_template_id]}
+
+  form_data_by_child = {}
+  school_family_survey_ids.each do |f_id|
+    form_responses = tc.get("forms.json", params: { form_template_id: f_id })
+    form_responses.each do |fr|
+      unless form_data_by_child.has_key?(fr['child_id'])
+        form_data_by_child[fr['child_id']] = []
+      end
+
+      form_data = {
+        'form_id': fr['id'],
+        'state': fr['state'],
+        'created_at_text': fr['created_at'],
+        'updated_at_text': fr['updated_at'],
+        'student_id': fr['child_id'],
+        'school_id': school['id']
+      }
+      fields = fr['fields']
+      fields.each do | key, value |
+        if !value.nil? && DataMapper.field_names_has_key?(key)
+          form_data[DataMapper.field_names_value_for(key).to_sym] = value
+        end
+      end
+
+      form_data_by_child[fr['child_id']].append(form_data)
+    end
+  end
+
+  form_data_by_child
 end
 
 # TC's classrooms endpoint doesn't return 'inactive' classrooms, but the child endpoint will return classroom_ids that point to these 'inactive' classrooms
@@ -343,7 +435,6 @@ def reasons_child_ignored_details(child)
   details
 end
 
-
 def does_children_collection_include(children, child)
   # if children.has_key?(child['fingerprint']) && not(is_child_ignored(children[child['fingerprint']]))
   if children.has_key?(child['fingerprint']) && not(children[child['fingerprint']]['ignore'])
@@ -427,9 +518,10 @@ tc = TransparentClassroom::Client.new
 tc.masquerade_id = ENV['TC_MASQUERADE_ID']
 
 schools = load_schools(tc)
+network_family_survey_forms = load_network_family_survey_form_templates(tc)
 
-#schools = schools[0..4]
-#schools.reject! {|s| s['name'] != 'Sweet Pea Montessori'}
+#schools = schools[4..8]
+#schools.reject! {|s| s['name'] != 'Capucine Montessori'}
 stats = {}
 
 puts '=' * 100
@@ -479,8 +571,75 @@ schools.each do |school|
       load_children(tc, school, session)
     end.flatten
 
+    children.each do |child|
+      if school['forms_by_child_id'].keys.include?(child['id'])
+        child_forms = school['forms_by_child_id'][child['id']]
+        child_latest_form = child_forms.max_by { |f| Date.strptime(f[:created_at_text]) }
+
+        if child_latest_form.has_key?(:ethnicity_response)
+          child['ethnicity_survey_original'] = child_latest_form[:ethnicity_response].clone
+          unless child_latest_form[:ethnicity_response].nil? ||
+             child_latest_form[:ethnicity_response] == "" ||
+             child_latest_form[:ethnicity_response] == []
+            child['ethnicity'] = child_latest_form[:ethnicity_response]
+          end
+        end
+
+        if child_latest_form.has_key?(:household_income_response)
+          child['household_income'] = child_latest_form[:household_income_response]
+        end
+
+        if child_latest_form.has_key?(:language_response)
+          child['dominant_language'] = child_latest_form[:language_response]
+        end
+      end
+
+      if child['ethnicity'].nil?
+        child['ethnicity'] = []
+      else
+        child['ethnicity'] = DataMapper.ethnicities_value_for(child['ethnicity'])
+      end
+
+      if child['household_income'].nil?
+        child['household_income'] = []
+      else
+        child['household_income'] = DataMapper.income_value_for(child['household_income'])
+      end
+
+      if child['dominant_language'].nil?
+        child['dominant_language'] = []
+      else
+        child['dominant_language'] = DataMapper.languages_value_for(child['dominant_language'])
+      end
+
+      child['is_afam'] = child['ethnicity'].include?('African-American, Afro-Caribbean or Black')
+      child['is_asam'] = child['ethnicity'].include?('Asian-American')
+      child['is_latinx'] = child['ethnicity'].include?('Hispanic, Latinx, or Spanish Origin')
+      child['is_me'] = child['ethnicity'].include?('Middle Eastern or North African')
+      child['is_natam'] = child['ethnicity'].include?('Native American or Alaska Native')
+      child['is_pi'] = child['ethnicity'].include?('Native Hawaiian or Other Pacific Islander')
+      child['is_white'] = child['ethnicity'].include?('White')
+      child['is_white_only'] = child['is_white'] && child['ethnicity'].length == 1
+      child['is_other_nonwhite'] = child['ethnicity'].include?('Other (non-white)')
+      child['is_mixed'] = child['ethnicity'].include?('Unspecified multiple ethnicities')
+      is_gom = child['is_afam'] || child['is_asam'] || child['is_latinx'] || child['is_me'] || child['is_natam'] || child['is_pi'] || child['is_other_nonwhite'] || child['is_mixed']
+      child['is_gom'] = (is_gom == 1 || is_gom == true)
+      is_afam_latinx = child['is_afam'] || child['is_latinx']
+      child['is_afam_latinx'] = (is_afam_latinx == 1 || is_afam_latinx == true)
+
+      child['is_low_income'] = child['household_income'] == 'Low'
+      child['is_medium_income'] = child['household_income'] == 'Medium'
+      child['is_high_income'] = child['household_income'] == 'High'
+    end
+
     children.uniq { |c| c['id'] }
   end
+
+  puts
+  puts "Loading Family Survey Forms"
+  puts '-' * 100
+  school_form_templates = load_school_family_survey_form_templates(tc, network_family_survey_forms, school)
+  school['forms_by_child_id'] = load_school_family_survey_form_data(tc, school_form_templates, school)
 
   puts
   puts "Loading Sessions"
@@ -573,8 +732,23 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
     'First',
     'Last',
     'Birthdate',
-    'Ethnicity',
+    'Ethnicity Original',
+    'Ethnicity Survey',
+    'Ethnicity Normalized',
+    'Is AFAM',
+    'Is ASAM',
+    'Is Latinx',
+    'Is ME',
+    'Is NATAM',
+    'Is PI',
+    'Is White',
+    'Is Mixed',
+    'Is GOM',
+    'Is AFAM Latinx',
     'Household Income',
+    'Is Low Income',
+    'Is Medium Income',
+    'Is High Income',
     'Dominant Language',
     "Classroom in #{CURRENT_YEAR}",
     "Level in #{CURRENT_YEAR}",
@@ -630,8 +804,23 @@ CSV.open("#{dir}/children_#{CURRENT_YEAR}.csv", 'wb') do |csv|
           child['first_name'],
           child['last_name'],
           child['birth_date'],
-          child['ethnicity']&.join(", "),
+          child['ethnicity_original'],
+          child['ethnicity_survey_original'],
+          "[#{child['ethnicity']&.map{|v| "\"#{v}\""}.join(", ")}]",
+          child['is_afam'],
+          child['is_asam'],
+          child['is_latinx'],
+          child['is_me'],
+          child['is_natam'],
+          child['is_pi'],
+          child['is_white'],
+          child['is_mixed'],
+          child['is_gom'],
+          child['is_afam_latinx'],
           child['household_income'],
+          child['is_low_income'],
+          child['is_medium_income'],
+          child['is_high_income'],
           child['dominant_language'],
           classroom ? classroom['name'] : nil,
           classroom ? classroom['level'] : nil,
@@ -659,8 +848,23 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
     'First',
     'Last',
     'Birthdate',
-    'Ethnicity',
+    'Ethnicity Original',
+    'Ethnicity Survey',
+    'Ethnicity Normalized',
+    'Is AFAM',
+    'Is ASAM',
+    'Is Latinx',
+    'Is ME',
+    'Is NATAM',
+    'Is PI',
+    'Is White',
+    'Is Mixed',
+    'Is GOM',
+    'Is AFAM Latinx',
     'Household Income',
+    'Is Low Income',
+    'Is Medium Income',
+    'Is High Income',
     'Dominant Language',
     "Classroom in #{PREVIOUS_YEAR}",
     "Level in #{PREVIOUS_YEAR}",
@@ -699,10 +903,35 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
 
     stats[school['id']] = school_stats = {
       graduated_school: [],
+      graduated_school_gom: [],
+      graduated_school_white: [],
+      graduated_school_low_income: [],
+      graduated_school_medium_income: [],
+      graduated_school_high_income: [],
       graduated_school_and_continued_in_network: [],
+      graduated_school_and_continued_in_network_gom: [],
+      graduated_school_and_continued_in_network_white: [],
+      graduated_school_and_continued_in_network_low_income: [],
+      graduated_school_and_continued_in_network_medium_income: [],
+      graduated_school_and_continued_in_network_high_income: [],
       continued: [],
+      continued_gom: [],
+      continued_white: [],
+      continued_low_income: [],
+      continued_medium_income: [],
+      continued_high_income: [],
       continued_at_school: [],
+      continued_at_school_gom: [],
+      continued_at_school_white: [],
+      continued_at_school_low_income: [],
+      continued_at_school_medium_income: [],
+      continued_at_school_high_income: [],
       continued_in_network: [],
+      continued_in_network_gom: [],
+      continued_in_network_white: [],
+      continued_in_network_low_income: [],
+      continued_in_network_medium_income: [],
+      continued_in_network_high_income: [],
       continued_at_school_kindergarten: [],
       continued_in_network_kindergarten: [],
       continued_at_school_infant_toddler: [],
@@ -710,7 +939,17 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       continued_at_school_kindergarten_or_infant_toddler: [],
       continued_in_network_kindergarten_or_infant_toddler: [],
       dropped_school: [],
+      dropped_school_gom: [],
+      dropped_school_white: [],
+      dropped_school_low_income: [],
+      dropped_school_medium_income: [],
+      dropped_school_high_income: [],
       dropped_school_but_continued_in_network: [],
+      dropped_school_but_continued_in_network_gom: [],
+      dropped_school_but_continued_in_network_white: [],
+      dropped_school_but_continued_in_network_low_income: [],
+      dropped_school_but_continued_in_network_medium_income: [],
+      dropped_school_but_continued_in_network_high_income: [],
       dropped_school_kindergarten: [],
       dropped_school_but_continued_in_network_kindergarten: [],
       dropped_school_infant_toddler: [],
@@ -718,7 +957,17 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       dropped_school_kindergarten_or_infant_toddler: [],
       dropped_school_but_continued_in_network_kindergarten_or_infant_toddler: [],
       enrolled_current_year: current_year['children'].reject{ |c| c['ignore'] },
+      enrolled_current_year_gom: [],
+      enrolled_current_year_white: [],
+      enrolled_current_year_low_income: [],
+      enrolled_current_year_medium_income: [],
+      enrolled_current_year_high_income: [],
       enrolled_previous_year: previous_year['children'].reject{ |c| c['ignore'] },
+      enrolled_previous_year_gom: [],
+      enrolled_previous_year_white: [],
+      enrolled_previous_year_low_income: [],
+      enrolled_previous_year_medium_income: [],
+      enrolled_previous_year_high_income: [],
       exit_reason_teacher_graduated: [],
       exit_reason_teacher_relocated: [],
       exit_reason_teacher_expense: [],
@@ -795,8 +1044,23 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         child['first_name'],
         child['last_name'],
         child['birth_date'],
-        child['ethnicity']&.join(", "),
+        child['ethnicity_original'],
+        child['ethnicity_survey_original'],
+        "[#{child['ethnicity']&.map{|v| "\"#{v}\""}.join(", ")}]",
+        child['is_afam'],
+        child['is_asam'],
+        child['is_latinx'],
+        child['is_me'],
+        child['is_natam'],
+        child['is_pi'],
+        child['is_white'],
+        child['is_mixed'],
+        child['is_gom'],
+        child['is_afam_latinx'],
         child['household_income'],
+        child['is_low_income'],
+        child['is_medium_income'],
+        child['is_high_income'],
         child['dominant_language'],
         classroom ? classroom['name'] : nil,
         classroom ? classroom['level'] : nil,
@@ -905,8 +1169,62 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
         end
       end
 
+      school_stats[:enrolled_previous_year_gom] = school_stats[:enrolled_previous_year].filter{|child| child['is_gom']}
+      school_stats[:enrolled_previous_year_white] = school_stats[:enrolled_previous_year].filter{|child| child['is_white_only']}
+      school_stats[:enrolled_previous_year_low_income] = school_stats[:enrolled_previous_year].filter{|child| child['is_low_income']}
+      school_stats[:enrolled_previous_year_medium_income] = school_stats[:enrolled_previous_year].filter{|child| child['is_medium_income']}
+      school_stats[:enrolled_previous_year_high_income] = school_stats[:enrolled_previous_year].filter{|child| child['is_high_income']}
+
+      school_stats[:enrolled_current_year_gom] = school_stats[:enrolled_current_year].filter{|child| child['is_gom']}
+      school_stats[:enrolled_current_year_white] = school_stats[:enrolled_current_year].filter{|child| child['is_white_only']}
+      school_stats[:enrolled_current_year_low_income] = school_stats[:enrolled_current_year].filter{|child| child['is_low_income']}
+      school_stats[:enrolled_current_year_medium_income] = school_stats[:enrolled_current_year].filter{|child| child['is_medium_income']}
+      school_stats[:enrolled_current_year_high_income] = school_stats[:enrolled_current_year].filter{|child| child['is_high_income']}
+
+      school_stats[:graduated_school_gom] = school_stats[:graduated_school].filter{|child| child['is_gom']}
+      school_stats[:graduated_school_white] = school_stats[:graduated_school].filter{|child| child['is_white_only']}
+      school_stats[:graduated_school_low_income] = school_stats[:graduated_school].filter{|child| child['is_low_income']}
+      school_stats[:graduated_school_medium_income] = school_stats[:graduated_school].filter{|child| child['is_medium_income']}
+      school_stats[:graduated_school_high_income] = school_stats[:graduated_school].filter{|child| child['is_high_income']}
+
+      school_stats[:graduated_school_and_continued_in_network_gom] = school_stats[:graduated_school_and_continued_in_network].filter{|child| child['is_gom']}
+      school_stats[:graduated_school_and_continued_in_network_white] = school_stats[:graduated_school_and_continued_in_network].filter{|child| child['is_white_only']}
+      school_stats[:graduated_school_and_continued_in_network_low_income] = school_stats[:graduated_school_and_continued_in_network].filter{|child| child['is_low_income']}
+      school_stats[:graduated_school_and_continued_in_network_medium_income] = school_stats[:graduated_school_and_continued_in_network].filter{|child| child['is_medium_income']}
+      school_stats[:graduated_school_and_continued_in_network_high_income] = school_stats[:graduated_school_and_continued_in_network].filter{|child| child['is_high_income']}
+
+      school_stats[:continued_gom] = school_stats[:continued].filter{|child| child['is_gom']}
+      school_stats[:continued_white] = school_stats[:continued].filter{|child| child['is_white_only']}
+      school_stats[:continued_low_income] = school_stats[:continued].filter{|child| child['is_low_income']}
+      school_stats[:continued_medium_income] = school_stats[:continued].filter{|child| child['is_medium_income']}
+      school_stats[:continued_high_income] = school_stats[:continued].filter{|child| child['is_high_income']}
+
+      school_stats[:continued_at_school_gom] = school_stats[:continued_at_school].filter{|child| child['is_gom']}
+      school_stats[:continued_at_school_white] = school_stats[:continued_at_school].filter{|child| child['is_white_only']}
+      school_stats[:continued_at_school_low_income] = school_stats[:continued_at_school].filter{|child| child['is_low_income']}
+      school_stats[:continued_at_school_medium_income] = school_stats[:continued_at_school].filter{|child| child['is_medium_income']}
+      school_stats[:continued_at_school_high_income] = school_stats[:continued_at_school].filter{|child| child['is_high_income']}
+
+      school_stats[:continued_in_network_gom] = school_stats[:continued_in_network].filter{|child| child['is_gom']}
+      school_stats[:continued_in_network_white] = school_stats[:continued_in_network].filter{|child| child['is_white_only']}
+      school_stats[:continued_in_network_low_income] = school_stats[:continued_in_network].filter{|child| child['is_low_income']}
+      school_stats[:continued_in_network_medium_income] = school_stats[:continued_in_network].filter{|child| child['is_medium_income']}
+      school_stats[:continued_in_network_high_income] = school_stats[:continued_in_network].filter{|child| child['is_high_income']}
+
+      school_stats[:dropped_school_gom] = school_stats[:dropped_school].filter{|child| child['is_gom']}
+      school_stats[:dropped_school_white] = school_stats[:dropped_school].filter{|child| child['is_white_only']}
+      school_stats[:dropped_school_low_income] = school_stats[:dropped_school].filter{|child| child['is_low_income']}
+      school_stats[:dropped_school_medium_income] = school_stats[:dropped_school].filter{|child| child['is_medium_income']}
+      school_stats[:dropped_school_high_income] = school_stats[:dropped_school].filter{|child| child['is_high_income']}
+
+      school_stats[:dropped_school_but_continued_in_network_gom] = school_stats[:dropped_school_but_continued_in_network].filter{|child| child['is_gom']}
+      school_stats[:dropped_school_but_continued_in_network_white] = school_stats[:dropped_school_but_continued_in_network].filter{|child| child['is_white_only']}
+      school_stats[:dropped_school_but_continued_in_network_low_income] = school_stats[:dropped_school_but_continued_in_network].filter{|child| child['is_low_income']}
+      school_stats[:dropped_school_but_continued_in_network_medium_income] = school_stats[:dropped_school_but_continued_in_network].filter{|child| child['is_medium_income']}
+      school_stats[:dropped_school_but_continued_in_network_high_income] = school_stats[:dropped_school_but_continued_in_network].filter{|child| child['is_high_income']}
+
       if child.has_key?('exit_reason') && child['exit_reason'] != nil
-        case child['exit_reason'].downcase()
+        case child['exit_reason'].downcase
         when 'graduated'
           school_stats[:exit_reason_teacher_graduated] << child
         when 'relocated'
@@ -941,7 +1259,7 @@ CSV.open("#{dir}/children_#{PREVIOUS_YEAR}.csv", 'wb') do |csv|
       end
 
       if child.has_key?('parent_exit_reason') && child['parent_exit_reason'] != nil
-        case child['parent_exit_reason'].downcase()
+        case child['parent_exit_reason'].downcase
         when 'graduated'
           school_stats[:exit_reason_parent_graduated] << child
         when 'relocated'
@@ -986,12 +1304,47 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
   csv << [
     'School',
     "#{PREVIOUS_YEAR} Total Children",
+    "#{PREVIOUS_YEAR} Total Children - GOM",
+    "#{PREVIOUS_YEAR} Total Children - White",
+    "#{PREVIOUS_YEAR} Total Children - Low Income",
+    "#{PREVIOUS_YEAR} Total Children - Medium Income",
+    "#{PREVIOUS_YEAR} Total Children - High Income",
     "#{CURRENT_YEAR} Total Children",
+    "#{CURRENT_YEAR} Total Children - GOM",
+    "#{CURRENT_YEAR} Total Children - White",
+    "#{CURRENT_YEAR} Total Children - Low Income",
+    "#{CURRENT_YEAR} Total Children - Medium Income",
+    "#{CURRENT_YEAR} Total Children - High Income",
     'Graduated from School',
+    'Graduated from School - GOM',
+    'Graduated from School - White',
+    'Graduated from School - Low Income',
+    'Graduated from School - Medium Income',
+    'Graduated from School - High Income',
     'Graduated from School and Continued in Network',
+    'Graduated from School and Continued in Network - GOM',
+    'Graduated from School and Continued in Network - White',
+    'Graduated from School and Continued in Network - Low Income',
+    'Graduated from School and Continued in Network - Medium Income',
+    'Graduated from School and Continued in Network - High Income',
     'Continued',
+    'Continued - GOM',
+    'Continued - White',
+    'Continued - Low Income',
+    'Continued - Medium Income',
+    'Continued - High Income',
     'Continued at School',
+    'Continued at School - GOM',
+    'Continued at School - White',
+    'Continued at School - Low Income',
+    'Continued at School - Medium Income',
+    'Continued at School - High Income',
     'Continued in Network',
+    'Continued in Network - GOM',
+    'Continued in Network - White',
+    'Continued in Network - Low Income',
+    'Continued in Network - Medium Income',
+    'Continued in Network - High Income',
     'Continued at School (Kindergarten Eligible)',
     'Continued in Network (Kindergarten Eligible)',
     'Continued at School (Infant/Toddler Classroom)',
@@ -999,7 +1352,17 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     'Continued at School (Kindergarten & Infant/Toddler Classroom)',
     'Continued in Network (Kindergarten & Infant/Toddler Classroom)',
     'Dropped School',
+    'Dropped School - GOM',
+    'Dropped School - White',
+    'Dropped School - Low Income',
+    'Dropped School - Medium Income',
+    'Dropped School - High Income',
     'Dropped School but Continued in Network',
+    'Dropped School but Continued in Network - GOM',
+    'Dropped School but Continued in Network - White',
+    'Dropped School but Continued in Network - Low Income',
+    'Dropped School but Continued in Network - Medium Income',
+    'Dropped School but Continued in Network - High Income',
     'Dropped School (Kindergarten Eligible)',
     'Dropped School but Continued in Network (Kindergarten Eligible)',
     'Dropped School (Infant/Toddler Classroom)',
@@ -1037,6 +1400,11 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     'Exit: Entered public system (parent)',
     'Exit: Transferred multi year (parent)',
     'Retention Rate',
+    'Retention Rate - GOM',
+    'Retention Rate - White',
+    'Retention Rate - Low Income',
+    'Retention Rate - Medium Income',
+    'Retention Rate - High Income',
     'Retention Rate (Ignoring Kindergarten Eligible)',
     'Retention Rate (Ignoring Infant/Toddler Classroom)',
     'Retention Rate (Ignoring Kindergarten Eligible & Infant/Toddler Classroom)',
@@ -1045,25 +1413,119 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
   stats.each do |school_id, school_stats|
     school = schools.find{ |s| s['id'] == school_id }
     tp, tc = school_stats[:enrolled_previous_year].length, school_stats[:enrolled_current_year].length
+
+    tp_gom = school_stats[:enrolled_previous_year_gom].length
+    tp_white = school_stats[:enrolled_previous_year_white].length
+    tp_low_income = school_stats[:enrolled_previous_year_low_income].length
+    tp_medium_income = school_stats[:enrolled_previous_year_medium_income].length
+    tp_high_income = school_stats[:enrolled_previous_year_high_income].length
+
+    tc_gom = school_stats[:enrolled_current_year_gom].length
+    tc_white = school_stats[:enrolled_current_year_white].length
+    tc_low_income = school_stats[:enrolled_current_year_low_income].length
+    tc_medium_income = school_stats[:enrolled_current_year_medium_income].length
+    tc_high_income = school_stats[:enrolled_current_year_high_income].length
+
     gs, gsc = school_stats[:graduated_school].length, school_stats[:graduated_school_and_continued_in_network].length
+
+    gs_gom = school_stats[:graduated_school_gom].length
+    gs_white = school_stats[:graduated_school_white].length
+    gs_low_income = school_stats[:graduated_school_low_income].length
+    gs_medium_income = school_stats[:graduated_school_medium_income].length
+    gs_high_income = school_stats[:graduated_school_high_income].length
+
+    gsc_gom = school_stats[:graduated_school_and_continued_in_network_gom].length
+    gsc_white = school_stats[:graduated_school_and_continued_in_network_white].length
+    gsc_low_income = school_stats[:graduated_school_and_continued_in_network_low_income].length
+    gsc_medium_income = school_stats[:graduated_school_and_continued_in_network_medium_income].length
+    gsc_high_income = school_stats[:graduated_school_and_continued_in_network_high_income].length
+
     c = school_stats[:continued].length
+
+    c_gom = school_stats[:continued_gom].length
+    c_white = school_stats[:continued_white].length
+    c_low_income = school_stats[:continued_low_income].length
+    c_medium_income = school_stats[:continued_medium_income].length
+    c_high_income = school_stats[:continued_high_income].length
+
     cs, cn = school_stats[:continued_at_school].length, school_stats[:continued_in_network].length
+
+    cs_gom = school_stats[:continued_at_school_gom].length
+    cs_white = school_stats[:continued_at_school_white].length
+    cs_low_income = school_stats[:continued_at_school_low_income].length
+    cs_medium_income = school_stats[:continued_at_school_medium_income].length
+    cs_high_income = school_stats[:continued_at_school_high_income].length
+
+    cn_gom = school_stats[:continued_in_network_gom].length
+    cn_white = school_stats[:continued_in_network_white].length
+    cn_low_income = school_stats[:continued_in_network_low_income].length
+    cn_medium_income = school_stats[:continued_in_network_medium_income].length
+    cn_high_income = school_stats[:continued_in_network_high_income].length
+
     csk, cnk = school_stats[:continued_at_school_kindergarten].length, school_stats[:continued_in_network_kindergarten].length
     csit, cnit = school_stats[:continued_at_school_infant_toddler].length, school_stats[:continued_in_network_infant_toddler].length
     cskit, cnkit = school_stats[:continued_at_school_kindergarten_or_infant_toddler].length, school_stats[:continued_in_network_kindergarten_or_infant_toddler].length
     ds, dscn = school_stats[:dropped_school].length, school_stats[:dropped_school_but_continued_in_network].length
+
+    ds_gom = school_stats[:dropped_school_gom].length
+    ds_white = school_stats[:dropped_school_white].length
+    ds_low_income = school_stats[:dropped_school_low_income].length
+    ds_medium_income = school_stats[:dropped_school_medium_income].length
+    ds_high_income = school_stats[:dropped_school_high_income].length
+
+    dscn_gom = school_stats[:dropped_school_but_continued_in_network_gom].length
+    dscn_white = school_stats[:dropped_school_but_continued_in_network_white].length
+    dscn_low_income = school_stats[:dropped_school_but_continued_in_network_low_income].length
+    dscn_medium_income = school_stats[:dropped_school_but_continued_in_network_medium_income].length
+    dscn_high_income = school_stats[:dropped_school_but_continued_in_network_high_income].length
+
     dsk, dscnk = school_stats[:dropped_school_kindergarten].length, school_stats[:dropped_school_but_continued_in_network_kindergarten].length
     dsit, dscnit = school_stats[:dropped_school_infant_toddler].length, school_stats[:dropped_school_but_continued_in_network_infant_toddler].length
     dskit, dscnkit = school_stats[:dropped_school_kindergarten_or_infant_toddler].length, school_stats[:dropped_school_but_continued_in_network_kindergarten_or_infant_toddler].length
     row = [
       school['name'],
       tp,
+      tp_gom,
+      tp_white,
+      tp_low_income,
+      tp_medium_income,
+      tp_high_income,
       tc,
+      tc_gom,
+      tc_white,
+      tc_low_income,
+      tc_medium_income,
+      tc_high_income,
       gs,
+      gs_gom,
+      gs_white,
+      gs_low_income,
+      gs_medium_income,
+      gs_high_income,
       gsc,
+      gsc_gom,
+      gsc_white,
+      gsc_low_income,
+      gsc_medium_income,
+      gsc_high_income,
       c,
+      c_gom,
+      c_white,
+      c_low_income,
+      c_medium_income,
+      c_high_income,
       cs,
+      cs_gom,
+      cs_white,
+      cs_low_income,
+      cs_medium_income,
+      cs_high_income,
       cn,
+      cn_gom,
+      cn_white,
+      cn_low_income,
+      cn_medium_income,
+      cn_high_income,
       csk,
       cnk,
       csit,
@@ -1071,7 +1533,17 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
       cskit,
       cnkit,
       ds,
+      ds_gom,
+      ds_white,
+      ds_low_income,
+      ds_medium_income,
+      ds_high_income,
       dscn,
+      dscn_gom,
+      dscn_white,
+      dscn_low_income,
+      dscn_medium_income,
+      dscn_high_income,
       dsk,
       dscnk,
       dsit,
@@ -1133,12 +1605,52 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
     end
 
     if ignored
-      row.concat(Array.new(4, nil))
+      row.concat(Array.new(9, nil))
       puts "#{school['name']} not enough session/children data: #{notes.join(', ')}"
     elsif (cs + ds) > 0 # Computing retention rate at school specifically, i.e. not considering when child continues in network
       rate = ((cs * 100.0) / (cs + ds)).round
       row << "#{rate}%"
       puts "#{school['name']} => #{rate}% #{notes.join(', ')}"
+
+      # Retention rate GOM
+      if (cs_gom + ds_gom) > 0
+        rate = ((cs_gom * 100.0) / (cs_gom + ds_gom)).round
+        row << "#{rate}%"
+      else
+        row << nil
+      end
+
+      # Retention rate White
+      if (cs_white + ds_white) > 0
+        rate = ((cs_white * 100.0) / (cs_white + ds_white)).round
+        row << "#{rate}%"
+      else
+        row << nil
+      end
+
+      # Retention rate Low Income
+      if (cs_low_income + ds_low_income) > 0
+        rate = ((cs_low_income * 100.0) / (cs_low_income + ds_low_income)).round
+        row << "#{rate}%"
+      else
+        row << nil
+      end
+
+      # Retention rate Medium Income
+      if (cs_medium_income + ds_medium_income) > 0
+        rate = ((cs_medium_income * 100.0) / (cs_medium_income + ds_medium_income)).round
+        row << "#{rate}%"
+      else
+        row << nil
+      end
+
+      # Retention rate High Income
+      if (cs_high_income + ds_high_income) > 0
+        rate = ((cs_high_income * 100.0) / (cs_high_income + ds_high_income)).round
+        row << "#{rate}%"
+      else
+        row << nil
+      end
 
       # Kindergarten retention
       if (cs - csk + ds - dsk) > 0
@@ -1170,9 +1682,9 @@ CSV.open("#{dir}/school_retention.csv", 'wb') do |csv|
         row << nil
       end
     elsif gs + c + ds == 0
-      row.concat(Array.new(4, "100%"))
+      row.concat(Array.new(9, "100%"))
     else
-      row.concat(Array.new(4, nil))
+      row.concat(Array.new(9, nil))
       puts "#{school['name']} not enough statistical data"
     end
 
@@ -1191,12 +1703,47 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     'Group Type',
     'Number Schools',
     "#{PREVIOUS_YEAR} Total Children",
+    "#{PREVIOUS_YEAR} Total Children - GOM",
+    "#{PREVIOUS_YEAR} Total Children - White",
+    "#{PREVIOUS_YEAR} Total Children - Low Income",
+    "#{PREVIOUS_YEAR} Total Children - Medium Income",
+    "#{PREVIOUS_YEAR} Total Children - High Income",
     "#{CURRENT_YEAR} Total Children",
+    "#{CURRENT_YEAR} Total Children - GOM",
+    "#{CURRENT_YEAR} Total Children - White",
+    "#{CURRENT_YEAR} Total Children - Low Income",
+    "#{CURRENT_YEAR} Total Children - Medium Income",
+    "#{CURRENT_YEAR} Total Children - High Income",
     'Graduated from School',
+    'Graduated from School - GOM',
+    'Graduated from School - White',
+    'Graduated from School - Low Income',
+    'Graduated from School - Medium Income',
+    'Graduated from School - High Income',
     'Graduated from School and Continued in Network',
+    'Graduated from School and Continued in Network - GOM',
+    'Graduated from School and Continued in Network - White',
+    'Graduated from School and Continued in Network - Low Income',
+    'Graduated from School and Continued in Network - Medium Income',
+    'Graduated from School and Continued in Network - High Income',
     'Continued',
+    'Continued - GOM',
+    'Continued - White',
+    'Continued - Low Income',
+    'Continued - Medium Income',
+    'Continued - High Income',
     'Continued at School',
+    'Continued at School - GOM',
+    'Continued at School - White',
+    'Continued at School - Low Income',
+    'Continued at School - Medium Income',
+    'Continued at School - High Income',
     'Continued in Network',
+    'Continued in Network - GOM',
+    'Continued in Network - White',
+    'Continued in Network - Low Income',
+    'Continued in Network - Medium Income',
+    'Continued in Network - High Income',
     'Continued at School (Kindergarten Eligible)',
     'Continued in Network (Kindergarten Eligible)',
     'Continued at School (Infant/Toddler Eligible)',
@@ -1204,7 +1751,17 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     'Continued at School (Kindergarten or Infant/Toddler Eligible)',
     'Continued in Network (Kindergarten or Infant/Toddler Eligible)',
     'Dropped School',
+    'Dropped School - GOM',
+    'Dropped School - White',
+    'Dropped School - Low Income',
+    'Dropped School - Medium Income',
+    'Dropped School - High Income',
     'Dropped School but Continued in Network',
+    'Dropped School but Continued in Network - GOM',
+    'Dropped School but Continued in Network - White',
+    'Dropped School but Continued in Network - Low Income',
+    'Dropped School but Continued in Network - Medium Income',
+    'Dropped School but Continued in Network - High Income',
     'Dropped School (Kindergarten Eligible)',
     'Dropped School but Continued in Network (Kindergarten Eligible)',
     'Dropped School (Infant/Toddler Classroom)',
@@ -1242,10 +1799,20 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     'Exit: Entered public system (parent)',
     'Exit: Transferred multi year (parent)',
     'Retention Rate (schools)',
+    'Retention Rate GOM (schools)',
+    'Retention Rate White (schools)',
+    'Retention Rate Low Income (schools)',
+    'Retention Rate Medium Income (schools)',
+    'Retention Rate High Income (schools)',
     'Retention Rate (schools: Ignoring Kindergarten Eligible)',
     'Retention Rate (schools: Ignoring Toddler/Infant Classrooms)',
     'Retention Rate (schools: Ignoring Kindergarten and Toddler/Infant Classrooms)',
     'Retention Rate (network)',
+    'Retention Rate GOM (network)',
+    'Retention Rate White (network)',
+    'Retention Rate Low Income (network)',
+    'Retention Rate Medium Income (network)',
+    'Retention Rate High income (network)',
     'Retention Rate (network: Ignoring Kindergarten Eligible)',
     'Retention Rate (network: Ignoring Toddler/Infant Classrooms)',
     'Retention Rate (network: Ignoring Kindergarten and Toddler/Infant Classrooms)',
@@ -1291,7 +1858,7 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       school
     end.compact
 
-    group_stats = {tp:0, tc: 0, gs: 0, gsc: 0, c: 0, cs: 0, cn: 0, csk: 0, cnk: 0, csit: 0, cnit: 0, cskit: 0, cnkit: 0, ds:0, dscn: 0, dsk: 0, dscnk: 0, dsit: 0, dscnit: 0, dskit: 0, dscnkit: 0, exit_reason_teacher_graduated: 0, exit_reason_teacher_relocated: 0, exit_reason_teacher_expense: 0, exit_reason_teacher_hours_offered: 0, exit_reason_teacher_location: 0, exit_reason_teacher_eligible_for_kindergarten: 0, exit_reason_teacher_asked_to_leave: 0, exit_reason_teacher_joined_sibling: 0, exit_reason_teacher_no_lottery_spot: 0, exit_reason_teacher_bad_fit: 0, exit_reason_teacher_equity: 0, exit_reason_teacher_family_dissatisfied: 0, exit_reason_teacher_natural_disaster: 0, exit_reason_teacher_entered_public_system: 0, exit_reason_teacher_transferred_multi_year: 0, exit_reason_parent_graduated: 0, exit_reason_parent_relocated: 0, exit_reason_parent_expense: 0, exit_reason_parent_hours_offered: 0, exit_reason_parent_location: 0, exit_reason_parent_eligible_for_kindergarten: 0, exit_reason_parent_asked_to_leave: 0, exit_reason_parent_joined_sibling: 0, exit_reason_parent_no_lottery_spot: 0, exit_reason_parent_bad_fit: 0, exit_reason_parent_equity: 0, exit_reason_parent_family_dissatisfied: 0, exit_reason_parent_natural_disaster: 0, exit_reason_parent_entered_public_system: 0, exit_reason_parent_transferred_multi_year: 0}
+    group_stats = {tp:0, tp_gom: 0, tp_white: 0, tp_low_income: 0, tp_medium_income: 0, tp_high_income: 0, tc: 0, tc_gom: 0, tc_white: 0, tc_low_income: 0, tc_medium_income: 0, tc_high_income: 0, gs: 0, gs_gom: 0, gs_white: 0, gs_low_income: 0, gs_medium_income: 0, gs_high_income: 0, gsc: 0, gsc_gom: 0, gsc_white: 0, gsc_low_income: 0, gsc_medium_income: 0, gsc_high_income: 0, c: 0, c_gom: 0, c_white: 0, c_low_income: 0, c_medium_income: 0, c_high_income: 0, cs: 0, cs_gom: 0, cs_white: 0, cs_low_income: 0, cs_medium_income: 0, cs_high_income: 0, cn: 0, cn_gom: 0, cn_white: 0, cn_low_income: 0, cn_medium_income: 0, cn_high_income: 0, csk: 0, cnk: 0, csit: 0, cnit: 0, cskit: 0, cnkit: 0, ds:0, ds_gom: 0, ds_white: 0, ds_low_income: 0, ds_medium_income: 0, ds_high_income: 0, dscn: 0, dscn_gom: 0, dscn_white: 0, dscn_low_income: 0, dscn_medium_income: 0, dscn_high_income: 0, dsk: 0, dscnk: 0, dsit: 0, dscnit: 0, dskit: 0, dscnkit: 0, exit_reason_teacher_graduated: 0, exit_reason_teacher_relocated: 0, exit_reason_teacher_expense: 0, exit_reason_teacher_hours_offered: 0, exit_reason_teacher_location: 0, exit_reason_teacher_eligible_for_kindergarten: 0, exit_reason_teacher_asked_to_leave: 0, exit_reason_teacher_joined_sibling: 0, exit_reason_teacher_no_lottery_spot: 0, exit_reason_teacher_bad_fit: 0, exit_reason_teacher_equity: 0, exit_reason_teacher_family_dissatisfied: 0, exit_reason_teacher_natural_disaster: 0, exit_reason_teacher_entered_public_system: 0, exit_reason_teacher_transferred_multi_year: 0, exit_reason_parent_graduated: 0, exit_reason_parent_relocated: 0, exit_reason_parent_expense: 0, exit_reason_parent_hours_offered: 0, exit_reason_parent_location: 0, exit_reason_parent_eligible_for_kindergarten: 0, exit_reason_parent_asked_to_leave: 0, exit_reason_parent_joined_sibling: 0, exit_reason_parent_no_lottery_spot: 0, exit_reason_parent_bad_fit: 0, exit_reason_parent_equity: 0, exit_reason_parent_family_dissatisfied: 0, exit_reason_parent_natural_disaster: 0, exit_reason_parent_entered_public_system: 0, exit_reason_parent_transferred_multi_year: 0}
     group_schools.each do |school|
       school_stats = stats[school['id']]
 
@@ -1309,12 +1876,47 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       end
 
       group_stats[:tp] += school_stats[:enrolled_previous_year].length
+      group_stats[:tp_gom] += school_stats[:enrolled_previous_year_gom].length
+      group_stats[:tp_white] += school_stats[:enrolled_previous_year_white].length
+      group_stats[:tp_low_income] += school_stats[:enrolled_previous_year_low_income].length
+      group_stats[:tp_medium_income] += school_stats[:enrolled_previous_year_medium_income].length
+      group_stats[:tp_high_income] += school_stats[:enrolled_previous_year_high_income].length
       group_stats[:tc] += school_stats[:enrolled_current_year].length
+      group_stats[:tc_gom] += school_stats[:enrolled_current_year_gom].length
+      group_stats[:tc_white] += school_stats[:enrolled_current_year_white].length
+      group_stats[:tc_low_income] += school_stats[:enrolled_current_year_low_income].length
+      group_stats[:tc_medium_income] += school_stats[:enrolled_current_year_medium_income].length
+      group_stats[:tc_high_income] += school_stats[:enrolled_current_year_high_income].length
       group_stats[:gs] += school_stats[:graduated_school].length
+      group_stats[:gs_gom] += school_stats[:graduated_school_gom].length
+      group_stats[:gs_white] += school_stats[:graduated_school_white].length
+      group_stats[:gs_low_income] += school_stats[:graduated_school_low_income].length
+      group_stats[:gs_medium_income] += school_stats[:graduated_school_medium_income].length
+      group_stats[:gs_high_income] += school_stats[:graduated_school_high_income].length
       group_stats[:gsc] += school_stats[:graduated_school_and_continued_in_network].length
+      group_stats[:gsc_gom] += school_stats[:graduated_school_and_continued_in_network_gom].length
+      group_stats[:gsc_white] += school_stats[:graduated_school_and_continued_in_network_white].length
+      group_stats[:gsc_low_income] += school_stats[:graduated_school_and_continued_in_network_low_income].length
+      group_stats[:gsc_medium_income] += school_stats[:graduated_school_and_continued_in_network_medium_income].length
+      group_stats[:gsc_high_income] += school_stats[:graduated_school_and_continued_in_network_high_income].length
       group_stats[:c] += school_stats[:continued].length
+      group_stats[:c_gom] += school_stats[:continued_gom].length
+      group_stats[:c_white] += school_stats[:continued_white].length
+      group_stats[:c_low_income] += school_stats[:continued_low_income].length
+      group_stats[:c_medium_income] += school_stats[:continued_medium_income].length
+      group_stats[:c_high_income] += school_stats[:continued_high_income].length
       group_stats[:cs] += school_stats[:continued_at_school].length
+      group_stats[:cs_gom] += school_stats[:continued_at_school_gom].length
+      group_stats[:cs_white] += school_stats[:continued_at_school_white].length
+      group_stats[:cs_low_income] += school_stats[:continued_at_school_low_income].length
+      group_stats[:cs_medium_income] += school_stats[:continued_at_school_medium_income].length
+      group_stats[:cs_high_income] += school_stats[:continued_at_school_high_income].length
       group_stats[:cn] += school_stats[:continued_in_network].length
+      group_stats[:cn_gom] += school_stats[:continued_in_network_gom].length
+      group_stats[:cn_white] += school_stats[:continued_in_network_white].length
+      group_stats[:cn_low_income] += school_stats[:continued_in_network_low_income].length
+      group_stats[:cn_medium_income] += school_stats[:continued_in_network_medium_income].length
+      group_stats[:cn_high_income] += school_stats[:continued_in_network_high_income].length
       group_stats[:csk] += school_stats[:continued_at_school_kindergarten].length
       group_stats[:cnk] += school_stats[:continued_in_network_kindergarten].length
       group_stats[:csit] += school_stats[:continued_at_school_infant_toddler].length
@@ -1322,7 +1924,17 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       group_stats[:cskit] += school_stats[:continued_at_school_kindergarten_or_infant_toddler].length
       group_stats[:cnkit] += school_stats[:continued_in_network_kindergarten_or_infant_toddler].length
       group_stats[:ds] += school_stats[:dropped_school].length
+      group_stats[:ds_gom] += school_stats[:dropped_school_gom].length
+      group_stats[:ds_white] += school_stats[:dropped_school_white].length
+      group_stats[:ds_low_income] += school_stats[:dropped_school_low_income].length
+      group_stats[:ds_medium_income] += school_stats[:dropped_school_medium_income].length
+      group_stats[:ds_high_income] += school_stats[:dropped_school_high_income].length
       group_stats[:dscn] += school_stats[:dropped_school_but_continued_in_network].length
+      group_stats[:dscn_gom] += school_stats[:dropped_school_but_continued_in_network_gom].length
+      group_stats[:dscn_white] += school_stats[:dropped_school_but_continued_in_network_white].length
+      group_stats[:dscn_low_income] += school_stats[:dropped_school_but_continued_in_network_low_income].length
+      group_stats[:dscn_medium_income] += school_stats[:dropped_school_but_continued_in_network_medium_income].length
+      group_stats[:dscn_high_income] += school_stats[:dropped_school_but_continued_in_network_high_income].length
       group_stats[:dsk] += school_stats[:dropped_school_kindergarten].length
       group_stats[:dscnk] += school_stats[:dropped_school_but_continued_in_network_kindergarten].length
       group_stats[:dsit] += school_stats[:dropped_school_infant_toddler].length
@@ -1361,7 +1973,106 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
       group_stats[:exit_reason_parent_transferred_multi_year] += school_stats[:exit_reason_parent_transferred_multi_year].length
     end
 
-    row = [gs_config['name'], gs_config['type'], group_schools.count, group_stats[:tp], group_stats[:tc], group_stats[:gs], group_stats[:gsc], group_stats[:c], group_stats[:cs], group_stats[:cn], group_stats[:csk], group_stats[:cnk], group_stats[:csit], group_stats[:cnit], group_stats[:cskit], group_stats[:cnkit], group_stats[:ds], group_stats[:dscn], group_stats[:dsk], group_stats[:dscnk], group_stats[:dsit], group_stats[:dscnit], group_stats[:dskit], group_stats[:dscnkit], group_stats[:exit_reason_teacher_graduated], group_stats[:exit_reason_teacher_relocated], group_stats[:exit_reason_teacher_expense], group_stats[:exit_reason_teacher_hours_offered], group_stats[:exit_reason_teacher_location], group_stats[:exit_reason_teacher_eligible_for_kindergarten], group_stats[:exit_reason_teacher_asked_to_leave], group_stats[:exit_reason_teacher_joined_sibling], group_stats[:exit_reason_teacher_no_lottery_spot], group_stats[:exit_reason_teacher_bad_fit], group_stats[:exit_reason_teacher_equity], group_stats[:exit_reason_teacher_family_dissatisfied], group_stats[:exit_reason_teacher_natural_disaster], group_stats[:exit_reason_teacher_entered_public_system], group_stats[:exit_reason_teacher_transferred_multi_year], group_stats[:exit_reason_parent_graduated], group_stats[:exit_reason_parent_relocated], group_stats[:exit_reason_parent_expense], group_stats[:exit_reason_parent_hours_offered], group_stats[:exit_reason_parent_location], group_stats[:exit_reason_parent_eligible_for_kindergarten], group_stats[:exit_reason_parent_asked_to_leave], group_stats[:exit_reason_parent_joined_sibling], group_stats[:exit_reason_parent_no_lottery_spot], group_stats[:exit_reason_parent_bad_fit], group_stats[:exit_reason_parent_equity], group_stats[:exit_reason_parent_family_dissatisfied], group_stats[:exit_reason_parent_natural_disaster], group_stats[:exit_reason_parent_entered_public_system], group_stats[:exit_reason_parent_transferred_multi_year]]
+    row = [
+      gs_config['name'],
+      gs_config['type'],
+      group_schools.count,
+      group_stats[:tp],
+      group_stats[:tp_gom],
+      group_stats[:tp_white],
+      group_stats[:tp_low_income],
+      group_stats[:tp_medium_income],
+      group_stats[:tp_high_income],
+      group_stats[:tc],
+      group_stats[:tc_gom],
+      group_stats[:tc_white],
+      group_stats[:tc_low_income],
+      group_stats[:tc_medium_income],
+      group_stats[:tc_high_income],
+      group_stats[:gs],
+      group_stats[:gs_gom],
+      group_stats[:gs_white],
+      group_stats[:gs_low_income],
+      group_stats[:gs_medium_income],
+      group_stats[:gs_high_income],
+      group_stats[:gsc],
+      group_stats[:gsc_gom],
+      group_stats[:gsc_white],
+      group_stats[:gsc_low_income],
+      group_stats[:gsc_medium_income],
+      group_stats[:gsc_high_income],
+      group_stats[:c],
+      group_stats[:c_gom],
+      group_stats[:c_white],
+      group_stats[:c_low_income],
+      group_stats[:c_medium_income],
+      group_stats[:c_high_income],
+      group_stats[:cs],
+      group_stats[:cs_gom],
+      group_stats[:cs_white],
+      group_stats[:cs_low_income],
+      group_stats[:cs_medium_income],
+      group_stats[:cs_high_income],
+      group_stats[:cn],
+      group_stats[:cn_gom],
+      group_stats[:cn_white],
+      group_stats[:cn_low_income],
+      group_stats[:cn_medium_income],
+      group_stats[:cn_high_income],
+      group_stats[:csk],
+      group_stats[:cnk],
+      group_stats[:csit],
+      group_stats[:cnit],
+      group_stats[:cskit],
+      group_stats[:cnkit],
+      group_stats[:ds],
+      group_stats[:ds_gom],
+      group_stats[:ds_white],
+      group_stats[:ds_low_income],
+      group_stats[:ds_medium_income],
+      group_stats[:ds_high_income],
+      group_stats[:dscn],
+      group_stats[:dscn_gom],
+      group_stats[:dscn_white],
+      group_stats[:dscn_low_income],
+      group_stats[:dscn_medium_income],
+      group_stats[:dscn_high_income],
+      group_stats[:dsk],
+      group_stats[:dscnk],
+      group_stats[:dsit],
+      group_stats[:dscnit],
+      group_stats[:dskit],
+      group_stats[:dscnkit],
+      group_stats[:exit_reason_teacher_graduated],
+      group_stats[:exit_reason_teacher_relocated],
+      group_stats[:exit_reason_teacher_expense],
+      group_stats[:exit_reason_teacher_hours_offered],
+      group_stats[:exit_reason_teacher_location],
+      group_stats[:exit_reason_teacher_eligible_for_kindergarten],
+      group_stats[:exit_reason_teacher_asked_to_leave],
+      group_stats[:exit_reason_teacher_joined_sibling],
+      group_stats[:exit_reason_teacher_no_lottery_spot],
+      group_stats[:exit_reason_teacher_bad_fit],
+      group_stats[:exit_reason_teacher_equity],
+      group_stats[:exit_reason_teacher_family_dissatisfied],
+      group_stats[:exit_reason_teacher_natural_disaster],
+      group_stats[:exit_reason_teacher_entered_public_system],
+      group_stats[:exit_reason_teacher_transferred_multi_year],
+      group_stats[:exit_reason_parent_graduated],
+      group_stats[:exit_reason_parent_relocated],
+      group_stats[:exit_reason_parent_expense],
+      group_stats[:exit_reason_parent_hours_offered],
+      group_stats[:exit_reason_parent_location],
+      group_stats[:exit_reason_parent_eligible_for_kindergarten],
+      group_stats[:exit_reason_parent_asked_to_leave],
+      group_stats[:exit_reason_parent_joined_sibling],
+      group_stats[:exit_reason_parent_no_lottery_spot],
+      group_stats[:exit_reason_parent_bad_fit],
+      group_stats[:exit_reason_parent_equity],
+      group_stats[:exit_reason_parent_family_dissatisfied],
+      group_stats[:exit_reason_parent_natural_disaster],
+      group_stats[:exit_reason_parent_entered_public_system],
+      group_stats[:exit_reason_parent_transferred_multi_year]]
 
     # School retention
     if (group_stats[:cs] + group_stats[:ds]) > 0 # computing avg. school retention rate (not considering retention within network)
@@ -1371,6 +2082,56 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     else
       row << nil
       puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention GOM
+    if (group_stats[:cs_gom] + group_stats[:ds_gom]) > 0 # computing avg. school retention rate (not considering retention within network)
+      rate = (group_stats[:cs_gom] * 100.0 / (group_stats[:cs_gom] + group_stats[:ds_gom])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} GOM (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} GOM (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention White
+    if (group_stats[:cs_white] + group_stats[:ds_white]) > 0 # computing avg. school retention rate (not considering retention within network)
+      rate = (group_stats[:cs_white] * 100.0 / (group_stats[:cs_white] + group_stats[:ds_white])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} White (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} White (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention Low Income
+    if (group_stats[:cs_low_income] + group_stats[:ds_low_income]) > 0 # computing avg. school retention rate (not considering retention within network)
+      rate = (group_stats[:cs_low_income] * 100.0 / (group_stats[:cs_low_income] + group_stats[:ds_low_income])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} Low Income (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} Low Income (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention Medium Income
+    if (group_stats[:cs_medium_income] + group_stats[:ds_medium_income]) > 0 # computing avg. school retention rate (not considering retention within network)
+      rate = (group_stats[:cs_medium_income] * 100.0 / (group_stats[:cs_medium_income] + group_stats[:ds_medium_income])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} Medium Income (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} Medium Income (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention High Income
+    if (group_stats[:cs_high_income] + group_stats[:ds_high_income]) > 0 # computing avg. school retention rate (not considering retention within network)
+      rate = (group_stats[:cs_high_income] * 100.0 / (group_stats[:cs_high_income] + group_stats[:ds_high_income])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} High Income (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} High Income (#{gs_config['type']}) not enough statistical data"
     end
 
     # School retention ignoring Kindergarten
@@ -1407,10 +2168,58 @@ CSV.open("#{dir}/grouped_retention.csv", 'wb') do |csv|
     if (group_stats[:c] + group_stats[:ds] - group_stats[:dscn]) > 0 # computing network retention rate (taking into account retention within network)
       rate = (group_stats[:c] * 100.0 / (group_stats[:c] + group_stats[:ds] - group_stats[:dscn])).round
       row << "#{rate}%"
-      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}%"
     else
       row << nil
       puts "#{gs_config['name']} (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # Network retention GOM
+    if (group_stats[:c_gom] + group_stats[:ds_gom] - group_stats[:dscn_gom]) > 0
+      rate = (group_stats[:c_gom] * 100.0 / (group_stats[:c_gom] + group_stats[:ds_gom] - group_stats[:dscn_gom])).round
+      row << "#{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} GOM (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # Network retention White
+    if (group_stats[:c_white] + group_stats[:ds_white] - group_stats[:dscn_white]) > 0
+      rate = (group_stats[:c_white] * 100.0 / (group_stats[:c_white] + group_stats[:ds_white] - group_stats[:dscn_white])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} White (#{gs_config['type']}) not enough statistical data"
+    end
+    
+    # School retention Low Income
+    if (group_stats[:c_low_income] + group_stats[:ds_low_income] - group_stats[:dscn_low_income]) > 0
+      rate = (group_stats[:c_low_income] * 100.0 / (group_stats[:c_low_income] + group_stats[:ds_low_income] - group_stats[:dscn_low_income])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} Low Income (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} Low Income (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention Medium Income
+    if (group_stats[:c_medium_income] + group_stats[:ds_medium_income] - group_stats[:dscn_medium_income]) > 0
+      rate = (group_stats[:c_medium_income] * 100.0 / (group_stats[:c_medium_income] + group_stats[:ds_medium_income] - group_stats[:dscn_medium_income])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} Medium Income (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} Medium Income (#{gs_config['type']}) not enough statistical data"
+    end
+
+    # School retention High Income
+    if (group_stats[:c_high_income] + group_stats[:ds_high_income] - group_stats[:dscn_high_income]) > 0
+      rate = (group_stats[:c_high_income] * 100.0 / (group_stats[:c_high_income] + group_stats[:ds_high_income] - group_stats[:dscn_high_income])).round
+      row << "#{rate}%"
+      puts "#{gs_config['name']} High Income (#{gs_config['type']}) => #{rate}%"
+    else
+      row << nil
+      puts "#{gs_config['name']} High Income (#{gs_config['type']}) not enough statistical data"
     end
 
     # Network retention ignoring Kindergarten
