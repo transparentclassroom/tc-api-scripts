@@ -4,3 +4,4 @@ output
 .ruby-version
 config.yml
 !/missing_children.template.csv
+!/lib/data_mapper/*.csv
