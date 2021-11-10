@@ -1,0 +1,23 @@
+source_field_name,target_field_name
+Race/Ethnicity,ethnicity_response
+Raza y etnia,ethnicity_response
+FRL,frl_response
+¿Califica su familia para recibir un subsidio para almuerzo gratis o precio reducido?,frl_response
+Household Income.income,household_income_response
+Household Size.income,household_income_response
+Situación socioeconómica.income,household_income_response
+Household Income.size,household_size_response
+Household Size.size,household_size_response
+Situación socioeconómica.size,household_size_response
+Home Language,language_response
+El idioma,language_response
+NPS,nps_response
+Feedback,feedback_response
+How likely are you to send your child to another Wildflower school (assuming one existed) once your child graduates from their current school? ,next_level_likelihood_response
+¿Qué tan probable es que envíe a su hijo a otra escuela Wildflower (suponiendo que existiera una) una vez que su hijo ya se haya graduado de su escuela actual?,next_level_likelihood_response
+Describe the reason for your answer.,next_level_likelihood_rationale_response
+Describe la razón de tu respuesta.,next_level_likelihood_rationale_response
+"If no Wildflower option is currently available in your community at the next Montessori level, how important is it to you that one opens?",next_level_importance_response
+"Si no hay una escuela Wildflower en su comunidad en el próximo nivel de Montessori, ¿qué tan importante es para usted que se abra?",next_level_importance_response
+Comments from this survey may be used anonymously to share feedback about our school in marketing materials. All child and parent names and any other identifiers will be removed.   ,marketing_opt_out_response
+Los comentarios de esta encuesta pudiesen ser utilizados de forma anónima para compartir retroalimentación sobre nuestra escuela en materiales de mercadeo.  Se eliminarán todos los nombres de padres e hijos y cualquier otro identificador.,marketing_opt_out_response

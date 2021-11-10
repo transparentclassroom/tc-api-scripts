@@ -2,5 +2,6 @@ output
 *.csv
 .ruby-gemset
 .ruby-version
-config.yml
+config*.yml
 !/missing_children.template.csv
+!/lib/data_mapper/*.csv
