@@ -7,8 +7,8 @@ require_relative 'lib/data_mapper/mapper'
 require_relative './lib/transparent_classroom/client'
 require_relative './lib/name_matcher/matcher'
 
-PREVIOUS_YEAR = '2019-20'
-CURRENT_YEAR = '2020-21'
+PREVIOUS_YEAR = '2020-21'
+CURRENT_YEAR = '2021-22'
 
 # Dates assume latest possible start and earliest possible finish
 # Min session length is meant to filter out unexpectedly short sessions, i.e. a winter or JTerm session
@@ -521,7 +521,7 @@ schools = load_schools(tc)
 network_family_survey_forms = load_network_family_survey_form_templates(tc)
 
 #schools = schools[4..8]
-#schools.reject! {|s| s['name'] != 'Capucine Montessori'}
+#schools.reject! {|s| s['name'] != 'Cosmos Montessori'}
 stats = {}
 
 puts '=' * 100
